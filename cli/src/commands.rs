@@ -431,22 +431,20 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
 
         // === Core Actions ===
         "click" => {
+            let (rest, human) = extract_human_args(&rest, CLICK_USAGE)?;
             let new_tab = rest.contains(&"--new-tab");
-            let human = rest.contains(&"--human");
             let sel = rest
                 .iter()
-                .find(|arg| **arg != "--new-tab" && **arg != "--human")
+                .find(|arg| **arg != "--new-tab")
                 .ok_or_else(|| ParseError::MissingArguments {
                     context: "click".to_string(),
-                    usage: "click <selector> [--new-tab] [--human]",
+                    usage: CLICK_USAGE,
                 })?;
             let mut cmd = json!({ "id": id, "action": "click", "selector": sel });
             if new_tab {
                 cmd["newTab"] = json!(true);
             }
-            if human {
-                cmd["inputMode"] = json!("human");
-            }
+            human.apply(&mut cmd);
             Ok(cmd)
         }
         "dblclick" => {
@@ -464,20 +462,23 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(json!({ "id": id, "action": "fill", "selector": sel, "value": rest[1..].join(" ") }))
         }
         "type" => {
+            let (rest, human) = extract_human_args(&rest, TYPE_USAGE)?;
             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
                 context: "type".to_string(),
-                usage: "type <selector> <text> [--clear] [--delay <ms>]",
+                usage: TYPE_USAGE,
             })?;
             // The daemon has always supported clear/delay, but the CLI used
             // to join every remaining arg into the text, so `--clear` was
             // literally typed into the field with a success response.
             let mut clear = false;
+            let mut keys = false;
             let mut delay: Option<u64> = None;
             let mut text_parts: Vec<&str> = Vec::new();
             let mut i = 1;
             while i < rest.len() {
                 match rest[i] {
                     "--clear" => clear = true,
+                    "--keys" => keys = true,
                     "--delay" => {
                         // Error rather than silently drop a malformed value;
                         // a dropped flag would type its argument into the field.
@@ -485,11 +486,11 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                             .get(i + 1)
                             .ok_or_else(|| ParseError::MissingArguments {
                                 context: "type --delay".to_string(),
-                                usage: "type <selector> <text> [--clear] [--delay <ms>]",
+                                usage: TYPE_USAGE,
                             })?;
                         delay = Some(raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
                             message: format!("--delay expects a number in ms, got '{}'", raw),
-                            usage: "type <selector> <text> [--clear] [--delay <ms>]",
+                            usage: TYPE_USAGE,
                         })?);
                         i += 1;
                     }
@@ -501,17 +502,30 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             if clear {
                 cmd["clear"] = json!(true);
             }
+            if keys {
+                cmd["keys"] = json!(true);
+            }
             if let Some(ms) = delay {
+                if human.requested {
+                    return Err(ParseError::InvalidValue {
+                        message: "--delay cannot be combined with --human; the human model sets the timing".to_string(),
+                        usage: TYPE_USAGE,
+                    });
+                }
                 cmd["delay"] = json!(ms);
             }
+            human.apply(&mut cmd);
             Ok(cmd)
         }
         "hover" => {
+            let (rest, human) = extract_human_args(&rest, HOVER_USAGE)?;
             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
                 context: "hover".to_string(),
-                usage: "hover <selector>",
+                usage: HOVER_USAGE,
             })?;
-            Ok(json!({ "id": id, "action": "hover", "selector": sel }))
+            let mut cmd = json!({ "id": id, "action": "hover", "selector": sel });
+            human.apply(&mut cmd);
+            Ok(cmd)
         }
         "focus" => {
             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
@@ -551,18 +565,17 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             }
         }
         "drag" => {
+            let (rest, human) = extract_human_args(&rest, DRAG_USAGE)?;
             let src = rest.first().ok_or_else(|| ParseError::MissingArguments {
                 context: "drag".to_string(),
-                usage: "drag <source> <target>",
+                usage: DRAG_USAGE,
             })?;
             let tgt = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: "drag".to_string(),
-                usage: "drag <source> <target>",
+                usage: DRAG_USAGE,
             })?;
             let mut cmd = json!({ "id": id, "action": "drag", "source": src, "target": tgt });
-            if rest.contains(&"--human") {
-                cmd["inputMode"] = json!("human");
-            }
+            human.apply(&mut cmd);
             Ok(cmd)
         }
         "upload" => {
@@ -613,14 +626,17 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             })?;
             match *sub {
                 "type" => {
-                    let text: String = rest[1..].join(" ");
+                    let (args, human) = extract_human_args(&rest[1..], KEYBOARD_TYPE_USAGE)?;
+                    let text: String = args.join(" ");
                     if text.is_empty() {
                         return Err(ParseError::MissingArguments {
                             context: "keyboard type".to_string(),
-                            usage: "keyboard type <text>",
+                            usage: KEYBOARD_TYPE_USAGE,
                         });
                     }
-                    Ok(json!({ "id": id, "action": "keyboard", "subaction": "type", "text": text }))
+                    let mut cmd = json!({ "id": id, "action": "keyboard", "subaction": "type", "text": text });
+                    human.apply(&mut cmd);
+                    Ok(cmd)
                 }
                 "inserttext" | "insertText" => {
                     let text: String = rest[1..].join(" ");
@@ -1606,6 +1622,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     Ok(cmd)
                 }
                 Some("list") => Ok(json!({ "id": id, "action": "tab_list" })),
+                Some("claim") => parse_tab_claim(&rest[1..], &id),
                 Some("close") => {
                     let mut cmd = json!({ "id": id, "action": "tab_close" });
                     if let Some(tab_ref) = rest.get(1) {
@@ -3001,11 +3018,124 @@ fn parse_is(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     }
 }
 
+const CLICK_USAGE: &str = "click <selector> [--new-tab] [--human [natural|careful]] [--seed <n>]";
+const TYPE_USAGE: &str =
+    "type <selector> <text> [--clear] [--delay <ms>] [--keys] [--human [natural|careful]] [--seed <n>]";
+const HOVER_USAGE: &str = "hover <selector> [--human [natural|careful]] [--seed <n>]";
+const DRAG_USAGE: &str = "drag <source> <target> [--human [natural|careful]] [--seed <n>]";
+const KEYBOARD_TYPE_USAGE: &str = "keyboard type <text> [--human [natural|careful]] [--seed <n>]";
+const MOUSE_MOVE_USAGE: &str =
+    "mouse move <x> <y> [--duration <ms>] [--steps <n>] [--human [natural|careful]] [--seed <n>]";
+
+/// `--human [natural|careful]` and `--seed <n>` from a command's arguments.
+#[derive(Debug, Clone, Default)]
+struct HumanArgs {
+    requested: bool,
+    profile: Option<String>,
+    seed: Option<u64>,
+}
+
+impl HumanArgs {
+    fn apply(&self, cmd: &mut Value) {
+        if self.requested {
+            cmd["inputMode"] = json!("human");
+        }
+        if let Some(profile) = &self.profile {
+            cmd["humanProfile"] = json!(profile);
+        }
+        if let Some(seed) = self.seed {
+            cmd["seed"] = json!(seed);
+        }
+    }
+}
+
+/// Remove the human-input flags and return the remaining arguments in order.
+/// `--human` optionally takes the next argument when it names a profile.
+fn extract_human_args<'a>(
+    rest: &[&'a str],
+    usage: &'static str,
+) -> Result<(Vec<&'a str>, HumanArgs), ParseError> {
+    let mut human = HumanArgs::default();
+    let mut remaining = Vec::with_capacity(rest.len());
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--human" => {
+                human.requested = true;
+                if let Some(next) = rest.get(i + 1) {
+                    if matches!(*next, "natural" | "careful") {
+                        human.profile = Some(next.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            "--seed" => {
+                let raw = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "--seed".to_string(),
+                        usage,
+                    })?;
+                human.seed = Some(raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--seed expects a non-negative integer, got '{}'", raw),
+                    usage,
+                })?);
+                i += 1;
+            }
+            other => remaining.push(other),
+        }
+        i += 1;
+    }
+    Ok((remaining, human))
+}
+
+fn parse_tab_claim(rest: &[&str], id: &str) -> Result<Value, ParseError> {
+    const USAGE: &str = "tab claim --url <url> [--title <title>]";
+    let mut url: Option<&str> = None;
+    let mut title: Option<&str> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--url" | "--title" => {
+                let flag = rest[i];
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("tab claim {}", flag),
+                        usage: USAGE,
+                    })?;
+                if flag == "--url" {
+                    url = Some(value);
+                } else {
+                    title = Some(value);
+                }
+                i += 2;
+            }
+            other => {
+                return Err(ParseError::InvalidValue {
+                    message: format!("unexpected argument '{}'", other),
+                    usage: USAGE,
+                });
+            }
+        }
+    }
+    let url = url.ok_or_else(|| ParseError::MissingArguments {
+        context: "tab claim".to_string(),
+        usage: USAGE,
+    })?;
+    let mut cmd = json!({ "id": id, "action": "tab_claim", "url": url });
+    if let Some(title) = title {
+        cmd["title"] = json!(title);
+    }
+    Ok(cmd)
+}
+
 fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     const VALID: &[&str] = &[
         "role",
         "text",
         "label",
+        "near",
         "placeholder",
         "alt",
         "title",
@@ -3021,14 +3151,15 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     })?;
 
     match *locator {
-        "role" | "text" | "label" | "placeholder" | "alt" | "title" | "testid" | "first"
-        | "last" => {
+        "role" | "text" | "label" | "near" | "placeholder" | "alt" | "title" | "testid"
+        | "first" | "last" => {
             let value = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: format!("find {}", locator),
                 usage: match *locator {
                     "role" => "find role <role> [action] [--name <name>] [--exact]",
                     "text" => "find text <text> [action] [value] [--exact]",
                     "label" => "find label <label> [action] [text] [--exact]",
+                    "near" => "find near <text> [action] [value] [--exact]",
                     "placeholder" => "find placeholder <text> [action] [text] [--exact]",
                     "alt" => "find alt <text> [action] [value] [--exact]",
                     "title" => "find title <text> [action] [value] [--exact]",
@@ -3093,6 +3224,13 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 }
                 "label" => {
                     let mut cmd = json!({ "id": id, "action": "getbylabel", "label": value, "subaction": subaction, "exact": exact });
+                    if let Some(v) = fill_value {
+                        cmd["value"] = json!(v);
+                    }
+                    Ok(cmd)
+                }
+                "near" => {
+                    let mut cmd = json!({ "id": id, "action": "getbynear", "text": value, "subaction": subaction, "exact": exact });
                     if let Some(v) = fill_value {
                         cmd["value"] = json!(v);
                     }
@@ -3203,28 +3341,40 @@ fn parse_mouse(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                     usage: "mouse move <x> <y>",
                 })?;
             let mut cmd = json!({ "id": id, "action": "mousemove", "x": x, "y": y });
-            let mut i = 3;
+            let (rest, human) = extract_human_args(&rest[3..], MOUSE_MOVE_USAGE)?;
+            human.apply(&mut cmd);
+            let mut i = 0;
             while i < rest.len() {
                 match rest[i] {
-                    "--duration" | "--steps" | "--seed" => {
+                    "--duration" | "--steps" => {
                         let flag = rest[i];
-                        let raw = rest.get(i + 1).ok_or_else(|| ParseError::MissingArguments {
-                            context: format!("mouse move {}", flag),
-                            usage: "mouse move <x> <y> [--duration <ms>] [--steps <n>] [--seed <n>]",
-                        })?;
+                        let raw = rest
+                            .get(i + 1)
+                            .ok_or_else(|| ParseError::MissingArguments {
+                                context: format!("mouse move {}", flag),
+                                usage: MOUSE_MOVE_USAGE,
+                            })?;
                         let value = raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
-                            message: format!("{} expects a non-negative integer, got '{}'", flag, raw),
-                            usage: "mouse move <x> <y> [--duration <ms>] [--steps <n>] [--seed <n>]",
+                            message: format!(
+                                "{} expects a non-negative integer, got '{}'",
+                                flag, raw
+                            ),
+                            usage: MOUSE_MOVE_USAGE,
                         })?;
-                        let key = match flag { "--duration" => "duration", "--steps" => "steps", _ => "seed" };
+                        let key = if flag == "--duration" {
+                            "duration"
+                        } else {
+                            "steps"
+                        };
                         cmd[key] = json!(value);
                         i += 2;
                     }
-                    "--human" => { cmd["inputMode"] = json!("human"); i += 1; }
-                    other => return Err(ParseError::InvalidValue {
-                        message: format!("unexpected argument '{}'", other),
-                        usage: "mouse move <x> <y> [--duration <ms>] [--steps <n>] [--seed <n>] [--human]",
-                    }),
+                    other => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("unexpected argument '{}'", other),
+                            usage: MOUSE_MOVE_USAGE,
+                        })
+                    }
                 }
             }
             Ok(cmd)
@@ -3602,6 +3752,106 @@ pub fn shell_words_split(s: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod human_and_claim_parse_tests {
+    use super::*;
+
+    fn args(input: &str) -> Vec<String> {
+        input.split_whitespace().map(String::from).collect()
+    }
+
+    fn parsed(input: &str) -> Value {
+        parse_command(&args(input), &crate::flags::parse_flags(&args(""))).unwrap()
+    }
+
+    #[test]
+    fn human_flag_defaults_to_natural_and_accepts_a_profile() {
+        let cmd = parsed("click @e1 --human");
+        assert_eq!(cmd["inputMode"], "human");
+        assert!(cmd.get("humanProfile").is_none());
+        let cmd = parsed("click @e1 --human careful --seed 42");
+        assert_eq!(cmd["selector"], "@e1");
+        assert_eq!(cmd["humanProfile"], "careful");
+        assert_eq!(cmd["seed"], 42);
+    }
+
+    #[test]
+    fn human_flag_is_accepted_on_every_pointer_and_typing_command() {
+        for (input, action) in [
+            ("drag @a @b --human natural --seed 1", "drag"),
+            ("hover @a --human careful --seed 2", "hover"),
+            ("mouse move 10 20 --human natural --seed 3", "mousemove"),
+            ("type @a hello --human careful --seed 4", "type"),
+        ] {
+            let cmd = parsed(input);
+            assert_eq!(cmd["action"], action);
+            assert_eq!(cmd["inputMode"], "human", "{input}");
+            assert!(cmd.get("seed").is_some(), "{input}");
+        }
+        let cmd = parsed("keyboard type hello world --human careful --seed 5");
+        assert_eq!(cmd["subaction"], "type");
+        assert_eq!(cmd["text"], "hello world");
+        assert_eq!(cmd["humanProfile"], "careful");
+    }
+
+    #[test]
+    fn human_does_not_swallow_following_text_unless_it_is_a_profile() {
+        let cmd = parsed("type @a --human hello world");
+        assert_eq!(cmd["text"], "hello world");
+    }
+
+    #[test]
+    fn invalid_seed_is_an_error() {
+        let result = parse_command(
+            &args("click @e1 --human --seed nope"),
+            &crate::flags::parse_flags(&args("")),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn type_keys_flag_is_parsed_and_not_typed() {
+        let cmd = parsed("type @a abc --keys --clear");
+        assert_eq!(cmd["keys"], true);
+        assert_eq!(cmd["clear"], true);
+        assert_eq!(cmd["text"], "abc");
+    }
+
+    #[test]
+    fn delay_and_human_are_mutually_exclusive() {
+        let result = parse_command(
+            &args("type @a abc --delay 50 --human"),
+            &crate::flags::parse_flags(&args("")),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tab_claim_parses_url_and_title() {
+        let cmd = parsed("tab claim --url example.com/orders --title Orders");
+        assert_eq!(cmd["action"], "tab_claim");
+        assert_eq!(cmd["url"], "example.com/orders");
+        assert_eq!(cmd["title"], "Orders");
+    }
+
+    #[test]
+    fn tab_claim_requires_url() {
+        let flags = crate::flags::parse_flags(&args(""));
+        assert!(parse_command(&args("tab claim"), &flags).is_err());
+        assert!(parse_command(&args("tab claim --title x"), &flags).is_err());
+        assert!(parse_command(&args("tab claim --url"), &flags).is_err());
+    }
+
+    #[test]
+    fn find_near_parses_action_and_value() {
+        let cmd = parsed("find near 邮箱 fill a@b.c");
+        assert_eq!(cmd["action"], "getbynear");
+        assert_eq!(cmd["text"], "邮箱");
+        assert_eq!(cmd["subaction"], "fill");
+        assert_eq!(cmd["value"], "a@b.c");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3636,6 +3886,7 @@ mod tests {
             device: None,
             auto_connect: false,
             pin_tab: false,
+            adopt_tab: false,
             session_name: None,
             restore: None,
             restore_save: None,

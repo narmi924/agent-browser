@@ -44,6 +44,8 @@ agent-browser snapshot -i
 # @e4 [link] "Learn more"
 ```
 
+In interactive mode (`-i`), a form control with no accessible name shows the nearest visible text before it, for example `textbox [near="邮箱：", ref=e4]`. Use [`find near`](/selectors) to act on it by that text. JSON output carries the same value as `refs.<id>.near`.
+
 ## Using refs
 
 Refs from the snapshot map directly to commands:

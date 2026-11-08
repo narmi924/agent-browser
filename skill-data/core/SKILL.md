@@ -144,12 +144,14 @@ For sessions that handle sensitive data, use `--allowed-domains` to restrict nav
 ```bash
 agent-browser click @e1                   # click
 agent-browser click @e1 --new-tab         # open link in new tab instead of navigating
-agent-browser click @e1 --human           # approach with reproducible curved movement
+agent-browser click @e1 --human           # human-paced approach (--human careful, --seed <n>)
 agent-browser dblclick @e1                # double-click
 agent-browser hover @e1                   # hover
 agent-browser focus @e1                   # focus (useful before keyboard input)
 agent-browser fill @e2 "hello"            # clear then type
 agent-browser type @e2 " world"           # type without clearing
+agent-browser type @e2 "abc" --keys       # real key events for each key-producible character
+agent-browser type @e2 "你好 abc" --human  # human-paced typing with corrected typos
 agent-browser press Enter                 # press a key at current focus
 agent-browser press Control+a             # key combination
 agent-browser check @e3                   # check checkbox
@@ -163,6 +165,12 @@ agent-browser drag @e1 @e2                # drag and drop
 agent-browser drag @e1 @e2 --human        # drag with curved, eased movement
 ```
 
+Every mutating command's JSON has `data.receipt`: `verified` (true, false, or null), `checks` (what was compared), and `effects` (`url_changed`, `new_tab`, `dialog_opened`, `dom_changed`, `target_removed`). Read `verified: false` as "the page did not confirm this"; do not assume success. Password, card, and one-time-code values are never echoed.
+
+Unnamed form controls in `snapshot -i` show the nearest visible text before them, for example `textbox [near="邮箱：", ref=e4]`. Fields with no associated label can be used directly with `find near` or `find label`.
+
+If the centre of a target is covered or clipped, `click` scrolls it into view and clicks the visible point nearest the centre. A target with no reachable point is refused with the covering element named. Clicks work in background tabs without bringing them to the front.
+
 ### When refs don't work or you don't want to snapshot
 
 Use semantic locators:
@@ -173,6 +181,7 @@ agent-browser find role heading text --name "Skills"     # implicit roles work: 
 agent-browser find text "Sign In" click
 agent-browser find text "Sign In" click --exact     # exact match only
 agent-browser find label "Email" fill "user@test.com"
+agent-browser find near "邮箱" fill "user@test.com"     # field beside plain text with no real label
 agent-browser find placeholder "Search" fill "query"
 agent-browser find testid "submit-btn" click
 agent-browser find first ".card" click
@@ -361,6 +370,8 @@ agent-browser --session b fill @e1 "bob@test.com"
 
 `AGENT_BROWSER_SESSION=myapp` sets the default session for the current shell.
 
+`--auto-connect` keeps the same safety on the user's own browser: it never navigates the tab they are looking at. Use `tab claim --url <url> [--title <text>]` to bind the session to one tab the user already has open (it fails closed unless exactly one tab matches), or `--adopt-tab` to take over the tab they are looking at.
+
 When several sessions share one Chrome over `--cdp <port>`, add `--pin-tab` so each session sticks to its own tab. Every session remembers its bound tab across daemon restarts; with `--pin-tab` a command whose bound tab was closed fails with a `tab_gone` error instead of acting on another session's tab. JSON output includes `"code": "tab_gone"`, `data.targetId`, and an optional sanitized `data.lastUrl` for recovery. Recover with `tab new <url>` or pick a tab from `tab list`. The flag is sticky per session, so pass it once (`--no-pin-tab` turns it off again). See `references/session-management.md` for details.
 
 ### Mock network requests
@@ -466,7 +477,7 @@ agent-browser snapshot -i
 agent-browser focus @e1
 agent-browser keyboard inserttext "text"    # bypasses key events
 # or
-agent-browser keyboard type "text"          # raw keystrokes, no selector
+agent-browser keyboard type "text"          # real key events, no selector; insertText only for characters no key produces (for example Chinese)
 ```
 
 **Page needs JS you can't get right in one shot** Use `eval --stdin` with a heredoc instead of inline:
@@ -494,7 +505,8 @@ EOF
 --headed                # show the window (default is headless)
 --engine <name>         # chrome (default), lightpanda, obscura (experimental)
 --webgpu                # enable WebGPU (software Vulkan on Linux, no GPU needed)
---auto-connect          # connect to an already-running Chrome
+--auto-connect          # connect to an already-running Chrome; works in a tab of its own, pinned like --pin-tab
+--adopt-tab             # with --auto-connect: work in the tab you are looking at instead
 --cdp <port|url>        # connect to a CDP port or WebSocket URL; root query slash is optional
 --profile <name|path>   # use a Chrome profile (login state survives)
 --headers <json>        # HTTP headers scoped to the URL's origin

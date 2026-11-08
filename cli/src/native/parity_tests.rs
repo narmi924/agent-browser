@@ -102,6 +102,8 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "tab_new",
     "tab_switch",
     "tab_close",
+    "tab_claim",
+    "getbynear",
     "viewport",
     "user_agent",
     "set_media",

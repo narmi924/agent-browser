@@ -98,7 +98,7 @@ agent-browser screenshot page.png
 agent-browser close
 ```
 
-Clicks fail early when another element covers the target's click point, for example a consent banner or modal. Dismiss or interact with the reported covering element, then take a fresh snapshot before retrying the original ref. Click and dblclick fail, instead of reporting success, when the element is hidden, disabled, or outside the viewport. `click --new-tab` opens the link's URL directly, so these checks do not apply to it.
+When the centre of a target is covered or clipped, click scrolls it into view and lands on the visible point closest to the centre where a hit test reaches the target. A target with no reachable point is refused with the covering element named, for example a consent banner or modal. Dismiss or interact with it, then take a fresh snapshot before retrying the original ref. Clicks in background tabs land without bringing the tab to the front. Click and dblclick fail, instead of reporting success, when the element is hidden, disabled, or outside the viewport. `click --new-tab` opens the link's URL directly, so these checks do not apply to it.
 
 Headless Chromium screenshots hide native scrollbars for consistent image output. Pass `--hide-scrollbars false` when launching to keep native scrollbars visible.
 
@@ -121,10 +121,10 @@ agent-browser read [url]              # Fetch agent-readable text, or read rende
 agent-browser click <sel>             # Click element (--new-tab to open in new tab)
 agent-browser dblclick <sel>          # Double-click element
 agent-browser focus <sel>             # Focus element
-agent-browser type <sel> <text>       # Type into element
+agent-browser type <sel> <text>       # Type into element (--keys for real key events, --human for human pacing)
 agent-browser fill <sel> <text>       # Clear and fill
 agent-browser press <key>             # Press key (Enter, Tab, Control+a) (alias: key)
-agent-browser keyboard type <text>    # Type with real keystrokes (no selector, current focus)
+agent-browser keyboard type <text>    # Type with real keystrokes (no selector, current focus); --human for human pacing
 agent-browser keyboard inserttext <text>  # Insert text without key events (no selector)
 agent-browser keydown <key>           # Hold key down
 agent-browser keyup <key>             # Release key
@@ -156,6 +156,18 @@ agent-browser close --all             # Close all active sessions
 agent-browser chat "<instruction>"    # AI chat: natural language browser control (single-shot)
 agent-browser chat                    # AI chat: interactive REPL mode
 ```
+
+### Action receipts
+
+`click`, `dblclick`, `fill`, `type`, `select`, `check`, `uncheck`, `drag`, `upload`, and `keyboard type` report what actually happened in `data.receipt` of their JSON output:
+
+```json
+{ "verified": true,
+  "checks": [{ "name": "value", "expected": "hello", "actual": "hello", "ok": true }],
+  "effects": { "url_changed": false, "new_tab": false, "dialog_opened": false, "dom_changed": false, "target_removed": false } }
+```
+
+`verified` is `true` when every check passed, `false` when one failed, and `null` when nothing could be checked (a JavaScript dialog is blocking the page, or the backend cannot observe it). Checks by command: click compares whether the page's click handler received the event (`click_received`, with `trusted`), fill and type read the value back, select reads the selected options, check reads the checked state, upload reads the file names on the input, and drag reports `content_changed` and `drop_received` for the drop target. Values of password, card, and one-time-code fields are not echoed in the receipt.
 
 ### WebMCP (experimental)
 
@@ -233,7 +245,8 @@ agent-browser is checked <sel>        # Check if checked
 ```bash
 agent-browser find role <role> <action> [value]       # By ARIA role
 agent-browser find text <text> <action> [value]       # By text content
-agent-browser find label <label> <action> [value]     # By label
+agent-browser find label <label> <action> [value]     # By label, or adjacent plain text when no label exists
+agent-browser find near <text> <action> [value]       # Form control beside this text
 agent-browser find placeholder <ph> <action> [value]  # By placeholder
 agent-browser find alt <text> <action> [value]        # By alt text
 agent-browser find title <text> <action> [value]      # By title attr
@@ -325,7 +338,16 @@ agent-browser mouse up [button]       # Release button
 agent-browser mouse wheel <dy> [dx]   # Scroll wheel
 ```
 
-Add `--human` to `click` or `drag` for curved, eased movement from the current cursor position. For timed mouse moves, `--duration` is the target total duration, including browser response time; a slow browser can still extend it.
+Add `--human` to `click`, `drag`, `hover`, `mouse move`, `type`, or `keyboard type` for human-paced input; see [Human-paced input](#human-paced-input). For timed mouse moves, `--duration` is the target total duration, including browser response time; a slow browser can still extend it.
+
+### Human-paced input
+
+`--human [natural|careful]` with an optional `--seed <n>` works on `click`, `drag`, `hover`, `mouse move`, `type`, and `keyboard type`. The same seed reproduces the same input.
+
+- **Pointer:** a curved path with a minimum-jerk speed profile, whole-pixel steps 7 to 13 ms apart, a duration from Fitts' law, sometimes an overshoot or undershoot with a short correction, a pause before pressing, and a varied press duration. The landing point stays inside the visible target.
+- **Typing:** uneven key intervals around 125 ms (`natural`) or 210 ms (`careful`), pauses between words and occasional thinking pauses, and occasional typos: a neighbouring key noticed one or two characters later and fixed with Backspace, or for Chinese a same-sound character fixed immediately. Password, card (`autocomplete="cc-*"`), and one-time-code fields never get typos. The receipt reports `verified: false` if the field does not end up with the requested text.
+
+`--human` applies only when you ask for it on a command, so plain `type` keeps its insert behavior for Electron webviews. `--input-mode human` applies human movement to `click`, `drag`, `hover`, and `mouse move`, but typing still needs an explicit `--human`.
 
 ### Browser Settings
 
@@ -390,6 +412,7 @@ agent-browser network har stop [output.har]    # Stop and save HAR (temp path if
 agent-browser tab                              # List tabs (shows `tabId` and optional label)
 agent-browser tab new [url]                    # New tab (optionally with URL)
 agent-browser tab new --label docs [url]       # New tab with a user-assigned label
+agent-browser tab claim --url <url> [--title <t>]  # Bind the session to one open tab and pin it (exactly one must match)
 agent-browser tab <t<N>|label>                 # Switch to a tab by id or label
 agent-browser tab close [t<N>|label]           # Close a tab (defaults to active)
 agent-browser window new                       # New window
@@ -1096,7 +1119,8 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--webgpu` | Enable WebGPU; SwiftShader software Vulkan on Linux, no GPU required (or `AGENT_BROWSER_WEBGPU` env) |
 | `--no-webmcp` | Disable experimental WebMCP support, which is enabled by default for locally launched Chrome (or `AGENT_BROWSER_NO_WEBMCP` env) |
 | `--cdp <port\|url>` | Connect via Chrome DevTools Protocol (port or WebSocket URL) |
-| `--auto-connect` | Auto-discover and connect to running Chrome (or `AGENT_BROWSER_AUTO_CONNECT` env) |
+| `--auto-connect` | Auto-discover and connect to running Chrome (or `AGENT_BROWSER_AUTO_CONNECT` env). Works in a tab of its own, pinned like `--pin-tab` |
+| `--adopt-tab` | With `--auto-connect`, work in the tab you are looking at instead of a new pinned tab (or `AGENT_BROWSER_ADOPT_TAB` env) |
 | `--pin-tab` | Pin the session to its bound tab; fail with `tab_gone` instead of falling back to another tab (or `AGENT_BROWSER_PIN_TAB` env) |
 | `--no-pin-tab` | Disable a sticky pin previously enabled with `--pin-tab` |
 | `--color-scheme <scheme>` | Color scheme: `dark`, `light`, `no-preference` (or `AGENT_BROWSER_COLOR_SCHEME` env) |
@@ -1618,6 +1642,13 @@ Auto-connect discovers Chrome by:
 1. Reading Chrome's `DevToolsActivePort` file from the default user data directory
 2. Falling back to probing common debugging ports (9222, 9229)
 3. If HTTP-based discovery (`/json/version`, `/json/list`) fails, falling back to a direct WebSocket connection
+
+Auto-connect opens exactly one WebSocket, so Chrome 144+ shows one permission prompt. If the prompt is still open after 20 seconds, the command fails with a "waiting for remote-debugging approval" error; approve the prompt and retry.
+
+Auto-connect never navigates the tab you are looking at. It works in a tab of its own and pins the session to it, the same as `--pin-tab`. If the tab is closed, commands fail with `tab_gone` instead of acting on another tab. To work somewhere else:
+
+- `tab claim --url <url> [--title <text>]` binds the session to one tab you already have open. It fails closed unless exactly one tab matches, and it never moves or focuses that tab.
+- `--adopt-tab` works in the tab you are looking at instead, and navigating will replace its page.
 
 This is useful when:
 

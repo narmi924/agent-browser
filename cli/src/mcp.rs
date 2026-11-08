@@ -99,6 +99,7 @@ const TOOL_TAB_NEW: &str = "agent_browser_tab_new";
 const TOOL_TAB_LIST: &str = "agent_browser_tab_list";
 const TOOL_TAB_SWITCH: &str = "agent_browser_tab_switch";
 const TOOL_TAB_CLOSE: &str = "agent_browser_tab_close";
+const TOOL_TAB_CLAIM: &str = "agent_browser_tab_claim";
 const TOOL_WINDOW_NEW: &str = "agent_browser_window_new";
 const TOOL_FRAME_SWITCH: &str = "agent_browser_frame_switch";
 const TOOL_FRAME_MAIN: &str = "agent_browser_frame_main";
@@ -365,6 +366,7 @@ const CORE_PROFILE_TOOLS: &[&str] = &[
     TOOL_TAB_LIST,
     TOOL_TAB_SWITCH,
     TOOL_TAB_CLOSE,
+    TOOL_TAB_CLAIM,
     TOOL_EVAL,
     TOOL_CLOSE,
 ];
@@ -469,6 +471,7 @@ const TABS_PROFILE_TOOLS: &[&str] = &[
     TOOL_TAB_LIST,
     TOOL_TAB_SWITCH,
     TOOL_TAB_CLOSE,
+    TOOL_TAB_CLAIM,
     TOOL_WINDOW_NEW,
     TOOL_FRAME_SWITCH,
     TOOL_FRAME_MAIN,
@@ -926,7 +929,9 @@ fn tools() -> Vec<Value> {
             json!({
                 "selector": selector_schema(),
                 "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab after applying session setup." },
-                "human": { "type": "boolean", "default": false, "description": "Approach the target with seeded, curved mouse movement." }
+                "human": { "type": "boolean", "default": false, "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing." },
+                "humanProfile": { "type": "string", "enum": ["natural", "careful"], "description": "Human input style. Defaults to natural." },
+                "seed": { "type": "integer", "minimum": 0, "description": "Seed for reproducible human input." }
             }),
             &["selector"],
         ),
@@ -948,7 +953,11 @@ fn tools() -> Vec<Value> {
                 "selector": selector_schema(),
                 "text": { "type": "string", "description": "Text to type." },
                 "clear": { "type": "boolean", "default": false, "description": "Clear the field before typing." },
-                "delayMs": { "type": "integer", "minimum": 0, "description": "Delay between keystrokes." }
+                "delayMs": { "type": "integer", "minimum": 0, "description": "Delay between keystrokes." },
+                "keys": { "type": "boolean", "default": false, "description": "Send a full key press for every character a key can produce; use insertText only for characters no key produces, such as Chinese. Plain type inserts printable text." },
+                "human": { "type": "boolean", "default": false, "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing." },
+                "humanProfile": { "type": "string", "enum": ["natural", "careful"], "description": "Human input style. Defaults to natural." },
+                "seed": { "type": "integer", "minimum": 0, "description": "Seed for reproducible human input." }
             }),
             &["selector", "text"],
         ),
@@ -961,7 +970,9 @@ fn tools() -> Vec<Value> {
             }),
             &["key"],
         ),
-        tool(TOOL_HOVER, "Hover element", "Hover an element.", json!({ "selector": selector_schema() }), &["selector"]),
+        tool(TOOL_HOVER, "Hover element", "Hover an element.", json!({ "selector": selector_schema(), "human": { "type": "boolean", "default": false, "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing." },
+                "humanProfile": { "type": "string", "enum": ["natural", "careful"], "description": "Human input style. Defaults to natural." },
+                "seed": { "type": "integer", "minimum": 0, "description": "Seed for reproducible human input." } }), &["selector"]),
         tool(TOOL_FOCUS, "Focus element", "Focus an element.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(TOOL_CHECK, "Check element", "Check a checkbox or switch.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(TOOL_UNCHECK, "Uncheck element", "Uncheck a checkbox or switch.", json!({ "selector": selector_schema() }), &["selector"]),
@@ -1066,7 +1077,9 @@ fn parity_tools() -> Vec<Value> {
             TOOL_DRAG,
             "Drag and drop",
             "Drag one element to another.",
-            json!({ "source": selector_schema(), "target": selector_schema(), "human": { "type": "boolean", "default": false, "description": "Use seeded, curved mouse movement." } }),
+            json!({ "source": selector_schema(), "target": selector_schema(), "human": { "type": "boolean", "default": false, "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing." },
+                "humanProfile": { "type": "string", "enum": ["natural", "careful"], "description": "Human input style. Defaults to natural." },
+                "seed": { "type": "integer", "minimum": 0, "description": "Seed for reproducible human input." } }),
             &["source", "target"],
         ),
         tool(
@@ -1100,8 +1113,10 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_KEYBOARD_TYPE,
             "Keyboard type",
-            "Type text at the current focus using real key events.",
-            json!({ "text": { "type": "string" } }),
+            "Type text at the current focus using real key events: keyDown, char, and keyUp for every character a key can produce, insertText only for the rest.",
+            json!({ "text": { "type": "string" }, "human": { "type": "boolean", "default": false, "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing." },
+                "humanProfile": { "type": "string", "enum": ["natural", "careful"], "description": "Human input style. Defaults to natural." },
+                "seed": { "type": "integer", "minimum": 0, "description": "Seed for reproducible human input." } }),
             &["text"],
         ),
         tool(
@@ -1179,8 +1194,8 @@ fn parity_tools() -> Vec<Value> {
             "Find element",
             "Find an element with semantic locators and optionally act on it.",
             json!({
-                "locator": { "type": "string", "enum": ["role", "text", "label", "placeholder", "alt", "title", "testid", "first", "last", "nth"] },
-                "value": { "type": "string", "description": "Role, text, label, selector, or test id." },
+                "locator": { "type": "string", "enum": ["role", "text", "label", "near", "placeholder", "alt", "title", "testid", "first", "last", "nth"] },
+                "value": { "type": "string", "description": "Role, text, label, nearby text, selector, or test id." },
                 "action": { "type": "string", "description": "Optional action: click, fill, check, hover, text." },
                 "text": { "type": "string", "description": "Optional value for the fill action." },
                 "index": { "type": "integer", "description": "Index for nth locator." },
@@ -1198,7 +1213,8 @@ fn parity_tools() -> Vec<Value> {
                 "y": number_schema(),
                 "durationMs": { "type": "integer", "minimum": 0, "description": "Target total movement duration in milliseconds, including browser response time." },
                 "steps": { "type": "integer", "minimum": 1, "maximum": 240, "description": "Number of interpolated events." },
-                "human": { "type": "boolean", "default": false, "description": "Add a seeded perpendicular curve." },
+                "human": { "type": "boolean", "default": false, "description": "Use the seeded human input model; with durationMs or steps, add a seeded perpendicular curve instead." },
+                "humanProfile": { "type": "string", "enum": ["natural", "careful"], "description": "Human input style. Defaults to natural." },
                 "seed": { "type": "integer", "minimum": 0, "description": "Seed for reproducible human movement." }
             }),
             &["x", "y"],
@@ -1372,6 +1388,13 @@ fn parity_tools() -> Vec<Value> {
             &[],
         ),
         tool(TOOL_TAB_LIST, "Tab list", "List tabs.", json!({}), &[]),
+        tool(
+            TOOL_TAB_CLAIM,
+            "Tab claim",
+            "Bind the session to one already-open tab and pin it. Fails closed unless exactly one tab matches the URL (a partial match, or an exact match that beats partial ones) and optional title.",
+            json!({ "url": { "type": "string", "description": "URL or part of a URL." }, "title": { "type": "string", "description": "Part of the tab title." } }),
+            &["url"],
+        ),
         tool(
             TOOL_TAB_SWITCH,
             "Tab switch",
@@ -2354,9 +2377,9 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_PRESS => call_press(arguments),
         TOOL_KEYDOWN => call_key_command(arguments, "keydown"),
         TOOL_KEYUP => call_key_command(arguments, "keyup"),
-        TOOL_KEYBOARD_TYPE => call_keyboard(arguments, "type"),
+        TOOL_KEYBOARD_TYPE => call_keyboard_type(arguments),
         TOOL_KEYBOARD_INSERT_TEXT => call_keyboard(arguments, "inserttext"),
-        TOOL_HOVER => call_simple_selector(arguments, "hover"),
+        TOOL_HOVER => call_hover(arguments),
         TOOL_FOCUS => call_simple_selector(arguments, "focus"),
         TOOL_CHECK => call_simple_selector(arguments, "check"),
         TOOL_UNCHECK => call_simple_selector(arguments, "uncheck"),
@@ -2436,6 +2459,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_TAB_NEW => call_tab_new(arguments),
         TOOL_TAB_LIST => call_literal(arguments, &["tab", "list"]),
         TOOL_TAB_SWITCH => call_one_string(arguments, "tab", "tab"),
+        TOOL_TAB_CLAIM => call_tab_claim(arguments),
         TOOL_TAB_CLOSE => call_optional_one(arguments, &["tab", "close"], "tab"),
         TOOL_WINDOW_NEW => call_literal(arguments, &["window", "new"]),
         TOOL_FRAME_SWITCH => call_one_string(arguments, "frame", "frame"),
@@ -2584,6 +2608,7 @@ const MCP_EXTRA_ARGS_GLOBALS: &[&str] = &[
     "--annotate",
     "--pin-tab",
     "--no-pin-tab",
+    "--adopt-tab",
     "-v",
     "--verbose",
     "-q",
@@ -2868,10 +2893,52 @@ fn click_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     if optional_bool(arguments, "newTab")?.unwrap_or(false) {
         args.push("--new-tab".to_string());
     }
+    push_human_args(arguments, &mut args)?;
+    Ok(args)
+}
+
+/// Forward the human-input arguments shared by pointer and typing tools.
+fn push_human_args(arguments: &Value, args: &mut Vec<String>) -> Result<(), ProtocolError> {
     if optional_bool(arguments, "human")?.unwrap_or(false) {
         args.push("--human".to_string());
+        if let Some(profile) = optional_string(arguments, "humanProfile")? {
+            args.push(profile);
+        }
     }
-    Ok(args)
+    if let Some(seed) = optional_u64(arguments, "seed")? {
+        args.push("--seed".to_string());
+        args.push(seed.to_string());
+    }
+    Ok(())
+}
+
+fn call_hover(arguments: &Value) -> Result<Value, ProtocolError> {
+    let selector = required_string(arguments, "selector")?;
+    let mut args = vec!["hover".to_string(), selector];
+    push_human_args(arguments, &mut args)?;
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_keyboard_type(arguments: &Value) -> Result<Value, ProtocolError> {
+    let text = required_string(arguments, "text")?;
+    let mut args = vec!["keyboard".to_string(), "type".to_string(), text];
+    push_human_args(arguments, &mut args)?;
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_tab_claim(arguments: &Value) -> Result<Value, ProtocolError> {
+    let url = required_string(arguments, "url")?;
+    let mut args = vec![
+        "tab".to_string(),
+        "claim".to_string(),
+        "--url".to_string(),
+        url,
+    ];
+    if let Some(title) = optional_string(arguments, "title")? {
+        args.push("--title".to_string());
+        args.push(title);
+    }
+    call_cli_tool(arguments, args, None)
 }
 
 fn call_click(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -2895,6 +2962,10 @@ fn call_type(arguments: &Value) -> Result<Value, ProtocolError> {
         args.push("--delay".to_string());
         args.push(delay.to_string());
     }
+    if optional_bool(arguments, "keys")?.unwrap_or(false) {
+        args.push("--keys".to_string());
+    }
+    push_human_args(arguments, &mut args)?;
     call_cli_tool(arguments, args, None)
 }
 
@@ -2907,9 +2978,7 @@ fn call_drag(arguments: &Value) -> Result<Value, ProtocolError> {
     let source = required_string(arguments, "source")?;
     let target = required_string(arguments, "target")?;
     let mut args = vec!["drag".to_string(), source, target];
-    if optional_bool(arguments, "human")?.unwrap_or(false) {
-        args.push("--human".to_string());
-    }
+    push_human_args(arguments, &mut args)?;
     call_cli_tool(arguments, args, None)
 }
 
@@ -3097,19 +3166,13 @@ fn mouse_move_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolErr
     let x = required_number_string(arguments, "x")?;
     let y = required_number_string(arguments, "y")?;
     let mut args = vec!["mouse".to_string(), "move".to_string(), x, y];
-    for (field, flag) in [
-        ("durationMs", "--duration"),
-        ("steps", "--steps"),
-        ("seed", "--seed"),
-    ] {
+    for (field, flag) in [("durationMs", "--duration"), ("steps", "--steps")] {
         if let Some(value) = optional_u64(arguments, field)? {
             args.push(flag.to_string());
             args.push(value.to_string());
         }
     }
-    if optional_bool(arguments, "human")?.unwrap_or(false) {
-        args.push("--human".to_string());
-    }
+    push_human_args(arguments, &mut args)?;
     Ok(args)
 }
 
@@ -4878,6 +4941,46 @@ mod tests {
                 .collect::<Vec<_>>());
         }
         json!({ "protocolVersion": PROTOCOL_VERSION, "tools": tools })
+    }
+
+    #[test]
+    fn human_arguments_reach_the_cli_parser() {
+        let args = click_command_args(&json!({
+            "selector": "#b", "human": true, "humanProfile": "careful", "seed": 7
+        }))
+        .unwrap();
+        let cmd = crate::commands::parse_command(&args, &crate::flags::parse_flags(&[])).unwrap();
+        assert_eq!(cmd["inputMode"], "human");
+        assert_eq!(cmd["humanProfile"], "careful");
+        assert_eq!(cmd["seed"], 7);
+    }
+
+    #[test]
+    fn tab_claim_tool_is_registered_and_requires_a_url() {
+        let catalog = tool_catalog();
+        let names: Vec<&str> = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&TOOL_TAB_CLAIM));
+        assert!(call_tab_claim(&json!({})).is_err());
+    }
+
+    #[test]
+    fn find_tool_accepts_the_near_locator() {
+        let catalog = tool_catalog();
+        let tool = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == TOOL_FIND)
+            .unwrap();
+        let locators = tool["inputSchema"]["properties"]["locator"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(locators.contains(&json!("near")));
     }
 
     #[test]

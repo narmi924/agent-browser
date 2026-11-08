@@ -141,6 +141,7 @@ pub struct Config {
     pub cdp: Option<String>,
     pub auto_connect: Option<bool>,
     pub pin_tab: Option<bool>,
+    pub adopt_tab: Option<bool>,
     pub headers: Option<String>,
     pub annotate: Option<bool>,
     pub color_scheme: Option<String>,
@@ -225,6 +226,7 @@ impl Config {
             cdp: other.cdp.or(self.cdp),
             auto_connect: other.auto_connect.or(self.auto_connect),
             pin_tab: other.pin_tab.or(self.pin_tab),
+            adopt_tab: other.adopt_tab.or(self.adopt_tab),
             headers: other.headers.or(self.headers),
             annotate: other.annotate.or(self.annotate),
             color_scheme: other.color_scheme.or(self.color_scheme),
@@ -481,6 +483,7 @@ pub struct Flags {
     pub device: Option<String>,
     pub auto_connect: bool,
     pub pin_tab: bool,
+    pub adopt_tab: bool,
     pub session_name: Option<String>,
     pub annotate: bool,
     pub color_scheme: Option<String>,
@@ -687,6 +690,8 @@ pub fn parse_flags(args: &[String]) -> Flags {
         auto_connect: env_var_is_truthy("AGENT_BROWSER_AUTO_CONNECT")
             || config.auto_connect.unwrap_or(false),
         pin_tab: env_var_is_truthy("AGENT_BROWSER_PIN_TAB") || config.pin_tab.unwrap_or(false),
+        adopt_tab: env_var_is_truthy("AGENT_BROWSER_ADOPT_TAB")
+            || config.adopt_tab.unwrap_or(false),
         session_name: env::var("AGENT_BROWSER_SESSION_NAME")
             .ok()
             .or(config.session_name),
@@ -1067,6 +1072,13 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--adopt-tab" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.adopt_tab = val;
+                if consumed {
+                    i += 1;
+                }
+            }
             "--session-name" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.session_name = Some(s.clone());
@@ -1247,6 +1259,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--auto-connect",
         "--pin-tab",
         "--no-pin-tab",
+        "--adopt-tab",
         "--no-ca-cert",
         "--use-system-ca",
         "--annotate",
@@ -1348,6 +1361,29 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         i += 1;
     }
     result
+}
+
+impl Flags {
+    /// `--auto-connect` works in a tab of its own (like `--pin-tab`) unless
+    /// the person explicitly asks to work in the tab they are looking at.
+    pub fn apply_auto_connect_tab_policy(&mut self) {
+        if !self.auto_connect {
+            return;
+        }
+        if self.adopt_tab {
+            self.pin_tab = false;
+            self.cli_pin_tab = true;
+        } else {
+            self.pin_tab = true;
+        }
+    }
+
+    /// The conflict that policy cannot resolve silently.
+    pub fn auto_connect_tab_conflict(&self) -> Option<&'static str> {
+        (self.auto_connect && !self.adopt_tab && self.cli_pin_tab && !self.pin_tab).then_some(
+            "Cannot use --no-pin-tab with --auto-connect; pass --adopt-tab to work in the tab you are looking at",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -2146,6 +2182,40 @@ mod tests {
         let flags = parse_flags(&args("--hide-scrollbars open"));
         assert!(flags.hide_scrollbars);
         assert!(flags.cli_hide_scrollbars);
+    }
+
+    #[test]
+    fn test_auto_connect_pins_by_default() {
+        let mut flags = parse_flags(&args("--auto-connect open"));
+        flags.apply_auto_connect_tab_policy();
+        assert!(flags.pin_tab, "auto-connect must behave like --pin-tab");
+    }
+
+    #[test]
+    fn test_auto_connect_adopt_tab_disables_the_pin() {
+        let mut flags = parse_flags(&args("--auto-connect --adopt-tab open"));
+        assert!(flags.adopt_tab);
+        flags.apply_auto_connect_tab_policy();
+        assert!(!flags.pin_tab, "--adopt-tab opts out of the pin");
+        assert!(flags.cli_pin_tab, "the opt-out must reach the daemon");
+    }
+
+    #[test]
+    fn test_adopt_tab_has_no_effect_without_auto_connect() {
+        let mut flags = parse_flags(&args("--adopt-tab open"));
+        flags.apply_auto_connect_tab_policy();
+        assert!(!flags.pin_tab);
+        assert!(!flags.cli_pin_tab);
+    }
+
+    #[test]
+    fn test_no_pin_tab_conflicts_with_auto_connect_only() {
+        let flags = parse_flags(&args("--auto-connect --no-pin-tab open"));
+        assert!(flags.auto_connect_tab_conflict().is_some());
+        let flags = parse_flags(&args("--auto-connect --adopt-tab --no-pin-tab open"));
+        assert!(flags.auto_connect_tab_conflict().is_none());
+        let flags = parse_flags(&args("--no-pin-tab open"));
+        assert!(flags.auto_connect_tab_conflict().is_none());
     }
 
     #[test]

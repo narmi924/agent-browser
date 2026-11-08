@@ -32,6 +32,32 @@ pub async fn discover_cdp_url_with_timeout(
     query: Option<&str>,
     timeout: Duration,
 ) -> Result<String, String> {
+    let http_err = match discover_cdp_http_endpoints(host, port, query, timeout).await {
+        Ok(ws_url) => return Ok(ws_url),
+        Err(e) => e,
+    };
+
+    // Final fallback: direct WebSocket at /devtools/browser.
+    // Chrome 136+ with UI-based remote debugging (chrome://inspect) exposes
+    // CDP over WebSocket but does not serve HTTP discovery endpoints.
+    match discover_cdp_ws(host, port, timeout).await {
+        Ok(ws_url) => Ok(append_query(&ws_url, query)),
+        Err(ws_err) => Err(format!(
+            "All CDP discovery methods failed for {}:{}: {}; WebSocket: {}",
+            host, port, http_err, ws_err
+        )),
+    }
+}
+
+/// Discover a CDP WebSocket URL using only HTTP endpoints. Unlike
+/// [`discover_cdp_url`] this never opens a WebSocket, so it cannot trigger
+/// Chrome's remote-debugging permission prompt.
+pub async fn discover_cdp_http_endpoints(
+    host: &str,
+    port: u16,
+    query: Option<&str>,
+    timeout: Duration,
+) -> Result<String, String> {
     // Primary: /json/version (standard path)
     let version_err = match fetch_cdp_info(host, port, timeout).await {
         Ok(info) => {
@@ -47,19 +73,11 @@ pub async fn discover_cdp_url_with_timeout(
     };
 
     // Fallback: /json/list (returns target list; look for the browser target)
-    let list_err = match fetch_cdp_list(host, port, timeout).await {
-        Ok(ws_url) => return Ok(append_query(&rewrite_ws_host(&ws_url, host, port), query)),
-        Err(e) => e,
-    };
-
-    // Final fallback: direct WebSocket at /devtools/browser.
-    // Chrome 136+ with UI-based remote debugging (chrome://inspect) exposes
-    // CDP over WebSocket but does not serve HTTP discovery endpoints.
-    match discover_cdp_ws(host, port, timeout).await {
-        Ok(ws_url) => Ok(append_query(&ws_url, query)),
-        Err(ws_err) => Err(format!(
-            "All CDP discovery methods failed for {}:{}: /json/version: {}; /json/list: {}; WebSocket: {}",
-            host, port, version_err, list_err, ws_err
+    match fetch_cdp_list(host, port, timeout).await {
+        Ok(ws_url) => Ok(append_query(&rewrite_ws_host(&ws_url, host, port), query)),
+        Err(list_err) => Err(format!(
+            "/json/version: {}; /json/list: {}",
+            version_err, list_err
         )),
     }
 }

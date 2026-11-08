@@ -549,6 +549,7 @@ fn print_primary_response(resp: &Response, action: Option<&str>, opts: &OutputOp
 
     if let Some(data) = &resp.data {
         print_lifecycle_note(data);
+        print_unverified_receipt(data);
 
         // Dialog status response
         if action == Some("dialog") {
@@ -863,6 +864,18 @@ fn print_primary_response(resp: &Response, action: Option<&str>, opts: &OutputOp
                 }
             }
             return;
+        }
+        if action == Some("tab_claim") {
+            if let Some(tab_id) = data.get("tabId").and_then(|v| v.as_str()) {
+                let url = data.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                println!(
+                    "{} Claimed tab [{}] and pinned this session to it: {}",
+                    color::success_indicator(),
+                    tab_id,
+                    url
+                );
+                return;
+            }
         }
         // Tab switch
         if action == Some("tab_switch") {
@@ -1544,6 +1557,29 @@ fn print_primary_response(resp: &Response, action: Option<&str>, opts: &OutputOp
     }
 }
 
+/// Say when the page does not confirm an action, in plain (non-JSON) output.
+fn print_unverified_receipt(data: &serde_json::Value) {
+    let receipt = &data["receipt"];
+    if receipt["verified"] != false {
+        return;
+    }
+    let failed: Vec<&str> = receipt["checks"]
+        .as_array()
+        .map(|checks| {
+            checks
+                .iter()
+                .filter(|check| check["ok"] == false)
+                .filter_map(|check| check["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "{} The page did not confirm this action (failed check: {})",
+        color::warning_indicator(),
+        failed.join(", ")
+    );
+}
+
 fn print_lifecycle_note(data: &serde_json::Value) {
     let Some(lifecycle) = data.get("lifecycle") else {
         return;
@@ -1740,13 +1776,19 @@ Examples:
             r##"
 agent-browser click - Click an element
 
-Usage: agent-browser click <selector> [--new-tab] [--human]
+Usage: agent-browser click <selector> [--new-tab] [--human [natural|careful]] [--seed <n>]
 
 Clicks on the specified element. The selector can be a CSS selector,
 XPath, or an element reference from snapshot (e.g., @e1).
 
-If another element covers the click point, agent-browser reports the
-covering element instead of dispatching a click to the wrong target.
+If the centre of the element is covered or clipped, agent-browser scrolls it
+into view and clicks the visible point closest to the centre where a hit test
+reaches the element. A fully covered element is refused with the covering
+element named, instead of dispatching a click to the wrong target.
+
+JSON output includes data.receipt: verified (true, false, or null when nothing
+can be checked), checks, and effects (url_changed, new_tab, dialog_opened,
+dom_changed, target_removed). Clicks work in background tabs.
 
 Click and dblclick fail, instead of reporting success, when the element
 is hidden, disabled, or outside the viewport. With --new-tab, click opens
@@ -1756,7 +1798,9 @@ Options:
   --new-tab            Open link in a new tab instead of navigating current tab.
                        The new tab inherits session setup before its first load.
                        Only works on elements with an href attribute.
-  --human              Approach along a reproducible eased curve
+  --human [profile]    Move along a curved, eased path, pause, and press for a varied time
+                       Profiles: natural (default), careful
+  --seed <n>           Seed for a reproducible --human run
                        Starts at the last pointer or element interaction
 
 Global Options:
@@ -1770,6 +1814,7 @@ Examples:
   agent-browser click "//button[@type='submit']"
   agent-browser click @e3 --new-tab
   agent-browser click @e3 --human
+  agent-browser click @e3 --human careful --seed 42
 "##
         }
         "dblclick" => {
@@ -1800,7 +1845,9 @@ agent-browser fill - Clear and fill an input field
 Usage: agent-browser fill <selector> <text>
 
 Clears the input field and fills it with the specified text.
-This replaces any existing content in the field.
+This replaces any existing content in the field. The value is read back;
+data.receipt.verified is false when the field does not hold the text
+(values of password, card, and one-time-code fields are not echoed).
 
 Global Options:
   --json               Output as JSON
@@ -1816,10 +1863,26 @@ Examples:
             r##"
 agent-browser type - Type text into an element
 
-Usage: agent-browser type <selector> <text>
+Usage: agent-browser type <selector> <text> [--clear] [--delay <ms>] [--keys] [--human [natural|careful]] [--seed <n>]
 
 Types text into the specified element character by character.
-Unlike fill, this does not clear existing content first.
+Unlike fill, this does not clear existing content first. Printable characters
+are inserted without key events; pass --keys or --human for pages that need
+real key presses. Electron webviews can reject repeated key events.
+
+Options:
+  --clear              Clear the field first
+  --delay <ms>         Delay between keystrokes
+  --keys               Send keyDown, char, keyUp for every character a key can
+                       produce, with correct key, code, and keyCode. Characters
+                       no key produces (for example Chinese) use insertText.
+  --human [profile]    Type at a human pace with pauses and corrected mistakes
+                       Profiles: natural (default), careful
+  --seed <n>           Seed for a reproducible --human run
+                       Password, card, and one-time-code fields never get mistakes
+
+JSON output includes data.receipt; verified is false if the field does not end
+up holding the requested text.
 
 Global Options:
   --json               Output as JSON
@@ -1828,6 +1891,8 @@ Global Options:
 Examples:
   agent-browser type "#search" "hello"
   agent-browser type @e2 "additional text"
+  agent-browser type @e2 "hello" --keys
+  agent-browser type @e2 "你好 world" --human careful --seed 7
 
 See Also:
   For typing into contenteditable editors (Lexical, ProseMirror, etc.)
@@ -1839,10 +1904,15 @@ See Also:
             r##"
 agent-browser hover - Hover over an element
 
-Usage: agent-browser hover <selector>
+Usage: agent-browser hover <selector> [--human [natural|careful]] [--seed <n>]
 
 Moves the mouse to hover over the specified element. Useful for
 triggering hover states or dropdown menus.
+
+Options:
+  --human [profile]    Move along a curved, eased path
+                       Profiles: natural (default), careful
+  --seed <n>           Seed for a reproducible --human run
 
 Global Options:
   --json               Output as JSON
@@ -1851,6 +1921,7 @@ Global Options:
 Examples:
   agent-browser hover "#dropdown-trigger"
   agent-browser hover @e4
+  agent-browser hover @e4 --human --seed 3
 "##
         }
         "focus" => {
@@ -1927,9 +1998,15 @@ Examples:
             r##"
 agent-browser drag - Drag and drop
 
-Usage: agent-browser drag <source> <target> [--human]
+Usage: agent-browser drag <source> <target> [--human [natural|careful]] [--seed <n>]
 
-Drags an element from source to target location.
+Drags an element from source to target location. JSON output includes
+data.receipt, which reports whether the drop target's content changed.
+
+Options:
+  --human [profile]    Approach, press, and drag along curved, eased paths
+                       Profiles: natural (default), careful
+  --seed <n>           Seed for a reproducible --human run
 
 Global Options:
   --json               Output as JSON
@@ -2060,8 +2137,11 @@ the current focus — essential for contenteditable editors like
 Lexical, ProseMirror, CodeMirror, and Monaco.
 
 Subcommands:
-  type <text>          Type text character-by-character with real
-                       key events (keydown, keypress, keyup per char)
+  type <text>          Type with real key events: keyDown, char, and keyUp
+                       with correct key, code, and keyCode for every character
+                       a key can produce; insertText only for the rest
+                       (for example Chinese). Accepts --human [natural|careful]
+                       and --seed <n> for human-paced typing.
   inserttext <text>    Insert text without key events (like paste)
 
 Note: For key combos (Enter, Control+a), use the 'press' command
@@ -2255,6 +2335,9 @@ Refs can be reused across snapshots. Take a fresh snapshot after navigation.
 If a ref's element was replaced, the action uses the one element with the same
 role and name. If that is ambiguous, it fails: run snapshot again.
 
+With -i, an unnamed form control shows the nearest visible text before it, for
+example: textbox [near="邮箱：", ref=e4]. Use find near to act on it by that text.
+
 Options:
   -i, --interactive    Only include interactive elements
   -u, --urls           Include href URLs for link elements
@@ -2431,7 +2514,10 @@ Finds elements using semantic locators and optionally performs an action.
 Locators:
   role <role>              Find by ARIA role (--name <n>, --exact)
   text <text>              Find by text content (--exact)
-  label <label>            Find by associated label (--exact)
+  label <label>            Find by associated label (--exact). Falls back to
+                           adjacent plain text when no real label exists,
+                           ignoring trailing :, ： and *
+  near <text>              Find a form control by the text beside it (--exact)
   placeholder <text>       Find by placeholder text (--exact)
   alt <text>               Find by alt text (--exact)
   title <text>             Find by title attribute (--exact)
@@ -2442,6 +2528,9 @@ Locators:
 
 Actions (default: click):
   click, fill, check, hover, text
+
+A label or nearby text that matches more than one control is an error rather
+than a guess.
 
 Options:
   --name <name>        Filter role by accessible name
@@ -2457,6 +2546,7 @@ Examples:
   agent-browser find role button click --name Submit
   agent-browser find text "Sign In" click
   agent-browser find label "Email" fill "user@example.com"
+  agent-browser find near "邮箱" fill "user@example.com"
   agent-browser find placeholder "Search..." fill "query"
   agent-browser find testid "login-form" click
   agent-browser find first "li.item" click
@@ -2483,7 +2573,8 @@ Subcommands:
 Movement Options:
   --duration <ms>       Target total duration, including browser response time
   --steps <n>           Number of movement events (1-240)
-  --human               Use a reproducible eased curve
+  --human [profile]     Move along a curved, eased path (natural or careful).
+                        With --duration or --steps, adds a seeded curve instead.
   --seed <n>            Seed for the human movement path
 
 Steps share one schedule; a slow browser can extend the requested duration.
@@ -2703,6 +2794,9 @@ Operations:
   list                       List open tabs with their ids and labels (default)
   new [url]                  Open a new tab
   new --label <name> [url]   Open a new tab with a label like `docs` or `app`
+  claim --url <url> [--title <title>]
+                             Bind the session to the one open tab that matches
+                             and pin it. Fails closed if zero or several match.
   close [t<N>|label|target]  Close a tab (current if no ref given)
   <t<N>|label|target>        Switch to a tab by id, label, or CDP target id
 
@@ -2716,6 +2810,7 @@ Examples:
   agent-browser tab new
   agent-browser tab new https://example.com
   agent-browser tab new --label docs https://docs.example.com
+  agent-browser tab claim --url example.com/orders --title Orders
   agent-browser tab t2
   agent-browser tab docs
   agent-browser tab close
@@ -4067,7 +4162,11 @@ Authentication:
   --state <path>             Load saved auth state (cookies + storage) from JSON file
                              (or AGENT_BROWSER_STATE env)
   --auto-connect             Connect to a running Chrome to reuse its auth state
+                             Works in a tab of its own and is pinned to it, like
+                             --pin-tab. Uses one WebSocket, so one approval prompt.
                              Tip: agent-browser --auto-connect state save ./auth.json
+  --adopt-tab                With --auto-connect, work in the tab you are looking at
+                             instead of a new pinned tab (or AGENT_BROWSER_ADOPT_TAB env)
   --headers <json>           HTTP headers scoped to URL's origin (e.g., Authorization bearer token)
 
 Options:

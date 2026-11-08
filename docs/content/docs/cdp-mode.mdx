@@ -71,6 +71,8 @@ This is useful when:
 
 When several sessions share one browser over CDP, each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts). A restarted daemon reattaches to the session's own tab instead of adopting whatever tab is currently active, which in a shared browser is usually another session's.
 
+`--auto-connect` works in a tab of its own and pins the session to it by default, so it never navigates the tab you are looking at. Use `tab claim --url <url> [--title <text>]` to bind a session to one tab you already have open (it fails closed unless exactly one tab matches), or `--adopt-tab` to work in the tab you are looking at. Auto-connect opens one WebSocket, so Chrome 144+ prompts for approval once.
+
 Pass `--pin-tab` (or set `AGENT_BROWSER_PIN_TAB=1`) to make the binding strict:
 
 ```bash
@@ -140,6 +142,7 @@ This enables control of:
     <tr><td><code>--headed</code></td><td>Show browser window</td></tr>
     <tr><td><code>{"--cdp <port|url>"}</code></td><td>CDP connection (port or WebSocket URL)</td></tr>
     <tr><td><code>--auto-connect</code></td><td>Auto-discover and connect to running Chrome</td></tr>
+    <tr><td><code>--adopt-tab</code></td><td>With <code>--auto-connect</code>, work in the tab you are looking at instead of a new pinned tab (or <code>AGENT_BROWSER_ADOPT_TAB</code>)</td></tr>
     <tr><td><code>--pin-tab</code></td><td>Pin the session to its bound tab (strict tab binding)</td></tr>
     <tr><td><code>--no-pin-tab</code></td><td>Disable a sticky pin previously enabled with <code>--pin-tab</code></td></tr>
     <tr><td><code>--color-scheme &lt;scheme&gt;</code></td><td>Persistent color scheme (<code>dark</code>, <code>light</code>, <code>no-preference</code>)</td></tr>

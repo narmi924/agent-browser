@@ -13,6 +13,8 @@ pub struct RefEntry {
     pub nth: Option<usize>,
     pub selector: Option<String>,
     pub frame_id: Option<String>,
+    /// Nearest visible text before an unnamed form control (`snapshot -i`).
+    pub near: Option<String>,
     allow_role_fallback: bool,
 }
 
@@ -68,9 +70,17 @@ impl RefMap {
                 nth,
                 selector: None,
                 frame_id: frame_id.map(|s| s.to_string()),
+                near: None,
                 allow_role_fallback: true,
             },
         );
+    }
+
+    /// Record the near text shown for this ref in the snapshot.
+    pub fn set_near(&mut self, ref_id: &str, near: &str) {
+        if let Some(entry) = self.map.get_mut(ref_id) {
+            entry.near = Some(near.to_string());
+        }
     }
 
     /// Add a ref that must keep resolving to this exact backend node. This is
@@ -86,6 +96,7 @@ impl RefMap {
                 nth: None,
                 selector: None,
                 frame_id: None,
+                near: None,
                 allow_role_fallback: false,
             },
         );
@@ -108,6 +119,7 @@ impl RefMap {
                 nth,
                 selector: Some(selector),
                 frame_id: None,
+                near: None,
                 allow_role_fallback: true,
             },
         );
@@ -330,9 +342,11 @@ async fn resolve_center_in_same_process_frame(
     frame_id: &str,
     selector: &str,
     require_actionable: bool,
-) -> Result<(f64, f64), String> {
+    jitter: Option<(f64, f64)>,
+) -> Result<ResolvedPoint, String> {
     let owner_object_id = frame_owner_object_id(client, session_id, frame_id).await?;
     let find_expr = build_find_element_js_in("doc", selector);
+    let jitter_js = jitter_literal(jitter);
     let function = format!(
         r#"function() {{
             const doc = this.contentDocument;
@@ -351,10 +365,9 @@ async fn resolve_center_in_same_process_frame(
                 y += frameRect.y + win.frameElement.clientTop;
                 win = win.parent;
             }}
-            const blockerAt = {BLOCKER_AT_JS};
-            const notActionable = {ACTIONABILITY_JS};
+            const resolvePoint = {RESOLVE_CLICK_POINT_JS};
             const topDoc = win ? win.document : doc;
-            return {{ x: x, y: y, reason: notActionable(topDoc, el, x, y), blocker: blockerAt(topDoc, el, x, y) }};
+            return resolvePoint(topDoc, el, x, y, {jitter_js});
         }}"#,
     );
     let result = client
@@ -368,27 +381,13 @@ async fn resolve_center_in_same_process_frame(
             Some(session_id),
         )
         .await?;
-    let value = result.get("result").and_then(|r| r.get("value"));
-    if require_actionable {
-        if let Some(reason) = value.and_then(|v| v.get("reason")).and_then(|v| v.as_str()) {
-            return Err(not_actionable_error(selector, reason));
-        }
-    }
-    if let Some(blocker) = value
-        .and_then(|v| v.get("blocker"))
-        .and_then(|v| v.as_str())
-    {
-        return Err(intercepted_error(selector, blocker));
-    }
-    let x = value.and_then(|v| v.get("x")).and_then(|v| v.as_f64());
-    let y = value.and_then(|v| v.get("y")).and_then(|v| v.as_f64());
-    match (x, y) {
-        (Some(x), Some(y)) => Ok((x, y)),
-        _ => Err(format!(
-            "Element not found in the selected frame: {}",
-            selector
-        )),
-    }
+    let value = result
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    parse_resolved_point(&value, selector, require_actionable)?
+        .ok_or_else(|| format!("Element not found in the selected frame: {}", selector))
 }
 
 /// Find a selector inside a same-process iframe and return its object handle.
@@ -422,6 +421,17 @@ async fn resolve_object_in_same_process_frame(
         .ok_or_else(|| format!("Element not found in the selected frame: {}", selector))
 }
 
+/// Where an interaction should land: a point inside the target's visible
+/// area, the CDP session the point is relative to, and the target's smaller
+/// dimension (the width term for Fitts' law).
+#[derive(Debug, Clone)]
+pub struct ElementPoint {
+    pub x: f64,
+    pub y: f64,
+    pub session_id: String,
+    pub target_size: f64,
+}
+
 pub async fn resolve_element_center(
     client: &CdpClient,
     session_id: &str,
@@ -430,6 +440,40 @@ pub async fn resolve_element_center(
     iframe_sessions: &HashMap<String, String>,
     require_actionable: bool,
 ) -> Result<(f64, f64, String), String> {
+    let point = resolve_element_point(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+        require_actionable,
+        None,
+    )
+    .await?;
+    Ok((point.x, point.y, point.session_id))
+}
+
+/// Find the point an interaction with `selector_or_ref` should land on. The
+/// centre is used when a hit test there reaches the element; otherwise the
+/// element is scrolled into view and its visible area is searched for the
+/// reachable point closest to the centre. `jitter` moves the landing point
+/// away from that point by fractions of the reachable extent (see
+/// `RESOLVE_CLICK_POINT_JS`), staying on the element.
+pub async fn resolve_element_point(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    iframe_sessions: &HashMap<String, String>,
+    require_actionable: bool,
+    jitter: Option<(f64, f64)>,
+) -> Result<ElementPoint, String> {
+    let point = |resolved: ResolvedPoint, session: &str| ElementPoint {
+        x: resolved.x,
+        y: resolved.y,
+        session_id: session.to_string(),
+        target_size: resolved.size,
+    };
     if let Some(ref_id) = parse_ref(selector_or_ref) {
         let entry = ref_map
             .get(&ref_id)
@@ -455,17 +499,17 @@ pub async fn resolve_element_center(
 
             if let Ok(r) = result {
                 let (x, y) = box_model_center(&r.model);
-                check_node_interception(
+                let resolved = check_node_interception(
                     client,
                     effective_session_id,
                     backend_node_id,
                     selector_or_ref,
-                    x,
-                    y,
+                    (x, y),
                     require_actionable,
+                    jitter,
                 )
                 .await?;
-                return Ok((x, y, effective_session_id.to_string()));
+                return Ok(point(resolved, effective_session_id));
             }
             if !entry.allow_role_fallback {
                 return Err(format!("Element ref {ref_id} is stale"));
@@ -497,17 +541,17 @@ pub async fn resolve_element_center(
             )
             .await?;
         let (x, y) = box_model_center(&result.model);
-        check_node_interception(
+        let resolved = check_node_interception(
             client,
             effective_session_id,
             fresh_id,
             selector_or_ref,
-            x,
-            y,
+            (x, y),
             require_actionable,
+            jitter,
         )
         .await?;
-        return Ok((x, y, effective_session_id.to_string()));
+        return Ok(point(resolved, effective_session_id));
     }
 
     // CSS selector: honor an active `frame <sel>` selection.
@@ -515,24 +559,36 @@ pub async fn resolve_element_center(
         // Cross-process iframe: its dedicated session's main frame IS the
         // iframe, so plain document-rooted resolution works there.
         if let Some(frame_session) = iframe_sessions.get(&frame_id) {
-            let (x, y) =
-                resolve_by_selector(client, frame_session, selector_or_ref, require_actionable)
-                    .await?;
-            return Ok((x, y, frame_session.clone()));
+            let resolved = resolve_by_selector(
+                client,
+                frame_session,
+                selector_or_ref,
+                require_actionable,
+                jitter,
+            )
+            .await?;
+            return Ok(point(resolved, frame_session));
         }
-        let (x, y) = resolve_center_in_same_process_frame(
+        let resolved = resolve_center_in_same_process_frame(
             client,
             session_id,
             &frame_id,
             selector_or_ref,
             require_actionable,
+            jitter,
         )
         .await?;
-        return Ok((x, y, session_id.to_string()));
+        return Ok(point(resolved, session_id));
     }
-    let (x, y) =
-        resolve_by_selector(client, session_id, selector_or_ref, require_actionable).await?;
-    Ok((x, y, session_id.to_string()))
+    let resolved = resolve_by_selector(
+        client,
+        session_id,
+        selector_or_ref,
+        require_actionable,
+        jitter,
+    )
+    .await?;
+    Ok(point(resolved, session_id))
 }
 
 /// Origin of a CDP session's viewport in the recorded page's CSS coordinates.
@@ -605,19 +661,21 @@ pub async fn session_viewport_offset(
     Err("Cyclic recording cursor frame ownership".to_string())
 }
 
-/// Hit-test a ref-resolved node at its computed click point and error if an
-/// unrelated element (overlay, banner, sticky header) would receive the input
-/// instead. Best effort: resolution failures skip the check rather than block
-/// the interaction.
+/// Decide where a ref-resolved node should be clicked. The centre stays when
+/// a hit test there reaches the node; a covered or clipped centre moves to the
+/// nearest visible point. Best effort: resolution failures keep the computed
+/// centre rather than block the interaction.
 async fn check_node_interception(
     client: &CdpClient,
     session_id: &str,
     backend_node_id: i64,
     target: &str,
-    x: f64,
-    y: f64,
+    center: (f64, f64),
     require_actionable: bool,
-) -> Result<(), String> {
+    jitter: Option<(f64, f64)>,
+) -> Result<ResolvedPoint, String> {
+    let (x, y) = center;
+    let fallback = ResolvedPoint { x, y, size: 0.0 };
     let resolved: Result<DomResolveNodeResult, String> = client
         .send_command_typed(
             "DOM.resolveNode",
@@ -630,24 +688,23 @@ async fn check_node_interception(
         )
         .await;
     let Ok(resolved) = resolved else {
-        return Ok(());
+        return Ok(fallback);
     };
     let Some(object_id) = resolved.object.object_id else {
-        return Ok(());
+        return Ok(fallback);
     };
     // Box-model coordinates are in the top-level viewport space, so the
     // hit-test starts from the top document. For an OOPIF node the
     // frameElement walk stops at the process boundary, where the frame's own
     // document and session-local coordinates are already consistent.
     let function = format!(
-        r#"function(x, y) {{
+        r#"function(x, y, jitter) {{
             let topDoc = this.ownerDocument || document;
             while (topDoc.defaultView && topDoc.defaultView.frameElement) {{
                 topDoc = topDoc.defaultView.frameElement.ownerDocument;
             }}
-            const blockerAt = {BLOCKER_AT_JS};
-            const notActionable = {ACTIONABILITY_JS};
-            return {{ blocker: blockerAt(topDoc, this, x, y), reason: notActionable(topDoc, this, x, y) }};
+            const resolvePoint = {RESOLVE_CLICK_POINT_JS};
+            return resolvePoint(topDoc, this, x, y, jitter);
         }}"#,
     );
     let result = client
@@ -656,27 +713,25 @@ async fn check_node_interception(
             Some(serde_json::json!({
                 "objectId": object_id,
                 "functionDeclaration": function,
-                "arguments": [{ "value": x }, { "value": y }],
+                "arguments": [
+                    { "value": x },
+                    { "value": y },
+                    { "value": jitter.map(|(u, v)| vec![u, v]) },
+                ],
                 "returnByValue": true,
             })),
             Some(session_id),
         )
         .await;
-    if let Ok(value) = result {
-        let value = value.get("result").and_then(|r| r.get("value"));
-        if require_actionable {
-            if let Some(reason) = value.and_then(|v| v.get("reason")).and_then(|v| v.as_str()) {
-                return Err(not_actionable_error(target, reason));
-            }
-        }
-        if let Some(blocker) = value
-            .and_then(|v| v.get("blocker"))
-            .and_then(|v| v.as_str())
-        {
-            return Err(intercepted_error(target, blocker));
-        }
-    }
-    Ok(())
+    let Ok(value) = result else {
+        return Ok(fallback);
+    };
+    let value = value
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(parse_resolved_point(&value, target, require_actionable)?.unwrap_or(fallback))
 }
 
 /// Coordinates from DOM.getBoxModel are viewport-relative, and input events
@@ -946,6 +1001,16 @@ pub(super) fn extract_ax_string(value: &Option<AXValue>) -> String {
     }
 }
 
+/// A JS expression that finds `selector` in the top document, when no frame
+/// is selected and the target is not a snapshot ref. Lets a caller combine the
+/// lookup with its own script in a single round trip.
+pub(super) fn top_document_lookup_expression(selector: &str) -> Option<String> {
+    if parse_ref(selector).is_some() || active_frame().is_some() {
+        return None;
+    }
+    Some(build_find_element_js(selector))
+}
+
 /// Build a JS expression that finds a DOM element by CSS selector or XPath.
 fn build_find_element_js(selector: &str) -> String {
     build_find_element_js_in("document", selector)
@@ -982,64 +1047,212 @@ fn build_count_elements_js(selector: &str) -> String {
     }
 }
 
-/// JS function source for `blockerAt(doc, el, x, y)`: returns a short
-/// description of the element that would actually receive a click at (x, y)
-/// when that element is unrelated to `el`, or null when the click would land
-/// on `el` (or something that activates it). Relations that count as "lands
-/// on el": shadow-including ancestors/descendants in either direction, and
-/// label/control association (custom checkboxes hide the input under a styled
-/// sibling inside the same label).
-const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
-    // Descend from the given document through same-origin iframes so a point
-    // over a frame resolves to the element inside it, in that frame's space.
-    let d = doc, lx = x, ly = y;
-    let hit = d.elementFromPoint(lx, ly);
-    while (hit && (hit.tagName === 'IFRAME' || hit.tagName === 'FRAME') && hit.contentDocument && hit !== el) {
-        const r = hit.getBoundingClientRect();
-        lx -= r.x + hit.clientLeft;
-        ly -= r.y + hit.clientTop;
-        d = hit.contentDocument;
-        hit = d.elementFromPoint(lx, ly);
-    }
-    if (!hit || hit === el) return null;
-    const up = (n) => n.parentNode || n.host || (n.getRootNode && n.getRootNode().host) || null;
-    for (let n = hit; n; n = up(n)) { if (n === el) return null; }
-    for (let n = el; n; n = up(n)) { if (n === hit) return null; }
-    const hitLabel = hit.closest ? hit.closest('label') : null;
-    if (hitLabel && (hitLabel.control === el || hitLabel.contains(el))) return null;
-    const elLabel = el.closest ? el.closest('label') : null;
-    if (elLabel && elLabel.contains(hit)) return null;
-    let desc = hit.tagName.toLowerCase();
-    if (hit.id) desc += '#' + hit.id;
-    else if (typeof hit.className === 'string' && hit.className.trim())
-        desc += '.' + hit.className.trim().split(/\s+/).slice(0, 2).join('.');
-    if (!hit.id && hit.closest) {
-        const anchored = hit.closest('[id]');
-        if (anchored && anchored !== hit)
-            desc += ' inside ' + anchored.tagName.toLowerCase() + '#' + anchored.id;
-    }
-    return desc;
+/// JS source for `resolvePoint(topDoc, el, x, y, jitter)`, which decides where a
+/// click aimed at `(x, y)` (the element's centre, in the coordinates of
+/// `topDoc`'s viewport) should land.
+///
+/// A hit test "reaches" the element when it lands on the element or a
+/// descendant (crossing open shadow roots and same-origin iframes), on a
+/// label/control partner, on the host of a closed shadow root that holds the
+/// element, or on an ancestor when the element opted out of pointer events.
+///
+/// If the centre does not reach, the element is scrolled into view and a grid
+/// over its visible area (its box clipped by overflow ancestors, frames, and
+/// the viewport) is hit-tested, nearest to the centre first. The result is
+/// `{x, y, size}` on success, or carries `blocker` (what covers the centre) or
+/// `reason` when nothing reaches. Engines missing a hit-test API fail open.
+const RESOLVE_CLICK_POINT_JS: &str = r#"(topDoc, el, x0, y0, jitter) => {
+    const up = (n) => n.assignedSlot || n.parentNode || n.host || null;
+    const hitAt = (doc, x, y) => {
+        let d = doc, lx = x, ly = y;
+        let hit = d.elementFromPoint(lx, ly);
+        for (let depth = 0; hit && depth < 32; depth++) {
+            if ((hit.tagName === 'IFRAME' || hit.tagName === 'FRAME') && hit !== el && hit.contentDocument) {
+                const r = hit.getBoundingClientRect();
+                lx -= r.x + hit.clientLeft;
+                ly -= r.y + hit.clientTop;
+                d = hit.contentDocument;
+                hit = d.elementFromPoint(lx, ly);
+                continue;
+            }
+            if (hit.shadowRoot && hit !== el) {
+                const inner = hit.shadowRoot.elementFromPoint(lx, ly);
+                if (inner && inner !== hit) { hit = inner; continue; }
+            }
+            break;
+        }
+        return hit;
+    };
+    const within = (outer, inner) => {
+        for (let n = inner; n; n = up(n)) { if (n === outer) return true; }
+        return false;
+    };
+    const pointerEventsOff = () => {
+        try { return el.ownerDocument.defaultView.getComputedStyle(el).pointerEvents === 'none'; }
+        catch (e) { return false; }
+    };
+    const reaches = (hit) => {
+        if (!hit) return false;
+        if (within(el, hit)) return true;
+        const hitLabel = hit.closest ? hit.closest('label') : null;
+        if (hitLabel && (hitLabel.control === el || hitLabel.contains(el))) return true;
+        const elLabel = el.closest ? el.closest('label') : null;
+        if (elLabel && elLabel.contains(hit)) return true;
+        let root = el.getRootNode ? el.getRootNode() : null;
+        while (root && root.host) {
+            if (root.host === hit) return true;
+            root = root.host.getRootNode ? root.host.getRootNode() : null;
+        }
+        return within(hit, el) && pointerEventsOff();
+    };
+    const describe = (hit) => {
+        let desc = hit.tagName.toLowerCase();
+        if (hit.id) desc += '#' + hit.id;
+        else if (typeof hit.className === 'string' && hit.className.trim())
+            desc += '.' + hit.className.trim().split(/\s+/).slice(0, 2).join('.');
+        if (!hit.id && hit.closest) {
+            const anchored = hit.closest('[id]');
+            if (anchored && anchored !== hit)
+                desc += ' inside ' + anchored.tagName.toLowerCase() + '#' + anchored.id;
+        }
+        return desc;
+    };
+    const clipToAncestors = (node, area) => {
+        const view = node.ownerDocument.defaultView;
+        let escape = view.getComputedStyle(node).position;
+        for (let n = up(node); n; n = up(n)) {
+            if (n.nodeType !== 1 || n === n.ownerDocument.documentElement || n === n.ownerDocument.body) continue;
+            const cs = view.getComputedStyle(n);
+            const contains = cs.transform !== 'none' || cs.perspective !== 'none' || cs.filter !== 'none' || (cs.contain || '').includes('paint');
+            if (escape === 'fixed' && !contains) continue;
+            if (escape === 'absolute' && cs.position === 'static' && !contains) continue;
+            if (cs.position !== 'static') escape = cs.position;
+            const r = n.getBoundingClientRect();
+            const left = r.left + n.clientLeft, top = r.top + n.clientTop;
+            if (cs.overflowX !== 'visible') {
+                area.left = Math.max(area.left, left);
+                area.right = Math.min(area.right, left + n.clientWidth);
+            }
+            if (cs.overflowY !== 'visible') {
+                area.top = Math.max(area.top, top);
+                area.bottom = Math.min(area.bottom, top + n.clientHeight);
+            }
+        }
+        return area;
+    };
+    const clampToViewport = (area, view) => {
+        area.left = Math.max(area.left, 0);
+        area.top = Math.max(area.top, 0);
+        area.right = Math.min(area.right, view.innerWidth);
+        area.bottom = Math.min(area.bottom, view.innerHeight);
+        return area;
+    };
+    let centre = { x: x0, y: y0 };
+    const searchVisiblePoint = () => {
+        const r = el.getBoundingClientRect();
+        let view = el.ownerDocument.defaultView;
+        let area = clampToViewport(clipToAncestors(el, { left: r.left, top: r.top, right: r.right, bottom: r.bottom }), view);
+        let ox = 0, oy = 0;
+        while (view.frameElement) {
+            const frame = view.frameElement, f = frame.getBoundingClientRect();
+            const fx = f.left + frame.clientLeft, fy = f.top + frame.clientTop;
+            area.left += fx; area.right += fx; area.top += fy; area.bottom += fy;
+            ox += fx; oy += fy;
+            area = clipToAncestors(frame, area);
+            view = frame.ownerDocument.defaultView;
+            area = clampToViewport(area, view);
+        }
+        centre = { x: (r.left + r.right) / 2 + ox, y: (r.top + r.bottom) / 2 + oy };
+        const w = area.right - area.left, h = area.bottom - area.top;
+        if (w < 1 || h < 1) return null;
+        const nx = Math.min(33, Math.max(3, Math.ceil(w / 4)));
+        const ny = Math.min(21, Math.max(3, Math.ceil(h / 4)));
+        const candidates = [];
+        for (let i = 0; i < nx; i++) {
+            for (let j = 0; j < ny; j++) {
+                const x = Math.round(area.left + (i + 0.5) * w / nx);
+                const y = Math.round(area.top + (j + 0.5) * h / ny);
+                candidates.push([(x - centre.x) ** 2 + (y - centre.y) ** 2, x, y]);
+            }
+        }
+        candidates.sort((a, b) => a[0] - b[0]);
+        for (const c of candidates) {
+            if (reaches(hitAt(topDoc, c[1], c[2]))) return { x: c[1], y: c[2] };
+        }
+        return null;
+    };
+    const jittered = (px, py) => {
+        const span = (dx, dy) => {
+            let reach = 0;
+            for (let step = 3; step <= 60; step += 3) {
+                if (!reaches(hitAt(topDoc, px + dx * step, py + dy * step))) break;
+                reach = step;
+            }
+            return reach;
+        };
+        const u = jitter[0], v = jitter[1];
+        const x = Math.round(px + u * (u < 0 ? span(-1, 0) : span(1, 0)) * 0.4);
+        const y = Math.round(py + v * (v < 0 ? span(0, -1) : span(0, 1)) * 0.4);
+        return reaches(hitAt(topDoc, x, y)) ? { x, y } : { x: px, y: py };
+    };
+    const out = { x: x0, y: y0, size: 0 };
+    try {
+        const view = el.ownerDocument.defaultView;
+        const rect = el.getBoundingClientRect();
+        out.size = Math.min(rect.width, rect.height);
+        const hidden = (rect.width <= 0 && rect.height <= 0)
+            || ['hidden', 'collapse'].includes(view.getComputedStyle(el).visibility);
+        if (hidden) out.reason = 'not visible';
+        else if (el.disabled || el.matches(':disabled')) out.reason = 'disabled';
+        const noBox = rect.width <= 0 || rect.height <= 0;
+        let centreHit = hitAt(topDoc, x0, y0);
+        let landed = noBox ? (!centreHit || reaches(centreHit) || within(centreHit, el)) : reaches(centreHit);
+        if (!landed && !noBox && !out.reason) {
+            if (el.scrollIntoViewIfNeeded) el.scrollIntoViewIfNeeded(true);
+            else el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            const found = searchVisiblePoint();
+            if (found) {
+                out.x = found.x;
+                out.y = found.y;
+                landed = true;
+            } else {
+                centreHit = hitAt(topDoc, centre.x, centre.y);
+            }
+        }
+        if (landed) {
+            if (jitter && !noBox) {
+                const landing = jittered(out.x, out.y);
+                out.x = landing.x;
+                out.y = landing.y;
+            }
+        } else if (centreHit) {
+            out.blocker = describe(centreHit);
+        } else if (!out.reason) {
+            const top = topDoc.defaultView;
+            if (x0 < 0 || y0 < 0 || x0 >= top.innerWidth || y0 >= top.innerHeight) {
+                out.reason = 'outside the viewport';
+            }
+        }
+    } catch (e) {}
+    return out;
 }"#;
 
-/// Returns why a click at (x, y) cannot reach `el`, or null when it can.
-/// It fails open when the engine lacks an API it needs.
-const ACTIONABILITY_JS: &str = r#"(doc, el, x, y) => {
-    try {
-        const rect = el.getBoundingClientRect();
-        if ((rect.width <= 0 && rect.height <= 0) || ['hidden', 'collapse'].includes(el.ownerDocument.defaultView.getComputedStyle(el).visibility)) return 'not visible';
-        if (el.disabled || el.matches(':disabled')) return 'disabled';
-        const view = doc.defaultView;
-        const outside = x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight;
-        if (outside && !doc.elementFromPoint(x, y)) return 'outside the viewport';
-    } catch (e) {}
-    return null;
-}"#;
+fn jitter_literal(jitter: Option<(f64, f64)>) -> String {
+    jitter
+        .map(|(u, v)| format!("[{u}, {v}]"))
+        .unwrap_or_else(|| "null".to_string())
+}
 
 fn build_selector_js(selector: &str) -> String {
+    build_selector_js_with_jitter(selector, None)
+}
+
+fn build_selector_js_with_jitter(selector: &str, jitter: Option<(f64, f64)>) -> String {
     let find_expr = build_find_element_js(selector);
+    let jitter_js = jitter_literal(jitter);
     // Input events dispatch at viewport coordinates, so an element outside the
     // viewport must be scrolled into view first or the click lands on nothing.
-    // The blocker check reports an overlay covering the click point instead of
+    // The resolver reports an overlay covering the whole element instead of
     // letting the input land on it and silently doing the wrong thing.
     format!(
         r#"(() => {{
@@ -1056,11 +1269,42 @@ fn build_selector_js(selector: &str) -> String {
             }}
             const x = rect.x + rect.width / 2;
             const y = rect.y + rect.height / 2;
-            const blockerAt = {BLOCKER_AT_JS};
-            const notActionable = {ACTIONABILITY_JS};
-            return {{ x: x, y: y, reason: notActionable(document, el, x, y), blocker: blockerAt(document, el, x, y) }};
+            const resolvePoint = {RESOLVE_CLICK_POINT_JS};
+            return resolvePoint(document, el, x, y, {jitter_js});
         }})()"#,
     )
+}
+
+/// A click point returned by [`RESOLVE_CLICK_POINT_JS`].
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedPoint {
+    x: f64,
+    y: f64,
+    size: f64,
+}
+
+/// Turn a resolver result into a point or the error that explains why no
+/// point reaches the element. `Ok(None)` means the resolver found no element.
+fn parse_resolved_point(
+    value: &Value,
+    target: &str,
+    require_actionable: bool,
+) -> Result<Option<ResolvedPoint>, String> {
+    if require_actionable {
+        if let Some(reason) = value.get("reason").and_then(|v| v.as_str()) {
+            return Err(not_actionable_error(target, reason));
+        }
+    }
+    if let Some(blocker) = value.get("blocker").and_then(|v| v.as_str()) {
+        return Err(intercepted_error(target, blocker));
+    }
+    let x = value.get("x").and_then(|v| v.as_f64());
+    let y = value.get("y").and_then(|v| v.as_f64());
+    let size = value.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    Ok(match (x, y) {
+        (Some(x), Some(y)) => Some(ResolvedPoint { x, y, size }),
+        _ => None,
+    })
 }
 
 async fn resolve_by_selector(
@@ -1068,8 +1312,9 @@ async fn resolve_by_selector(
     session_id: &str,
     selector: &str,
     require_actionable: bool,
-) -> Result<(f64, f64), String> {
-    let js = build_selector_js(selector);
+    jitter: Option<(f64, f64)>,
+) -> Result<ResolvedPoint, String> {
+    let js = build_selector_js_with_jitter(selector, jitter);
 
     let result: EvaluateResult = client
         .send_command_typed(
@@ -1084,26 +1329,13 @@ async fn resolve_by_selector(
         .await?;
 
     let val = result.result.value.unwrap_or(Value::Null);
-    if require_actionable {
-        if let Some(reason) = val.get("reason").and_then(|v| v.as_str()) {
-            return Err(not_actionable_error(selector, reason));
-        }
-    }
-    if let Some(blocker) = val.get("blocker").and_then(|v| v.as_str()) {
-        return Err(intercepted_error(selector, blocker));
-    }
-    let x = val.get("x").and_then(|v| v.as_f64());
-    let y = val.get("y").and_then(|v| v.as_f64());
-
-    match (x, y) {
-        (Some(x), Some(y)) => Ok((x, y)),
-        _ => Err(format!("Element not found: {}", selector)),
-    }
+    parse_resolved_point(&val, selector, require_actionable)?
+        .ok_or_else(|| format!("Element not found: {}", selector))
 }
 
 fn intercepted_error(target: &str, blocker: &str) -> String {
     format!(
-        "Element '{}' is covered by <{}> at its click point, so the input would land on that element instead. Dismiss or interact with the covering element first (it is often a dialog, banner, or sticky header).",
+        "Element '{}' is covered by <{}> at every visible point, so the input would land on that element instead. Dismiss or interact with the covering element first (it is often a dialog, banner, or sticky header).",
         target, blocker
     )
 }
@@ -1773,6 +2005,44 @@ mod tests {
 
         assert_eq!(map.durable_ref("page-a", None, 42), Some("e1"));
         assert_eq!(map.durable_ref("page-b", None, 42), None);
+    }
+
+    #[test]
+    fn resolved_point_refuses_a_covered_target_and_keeps_the_message() {
+        let error = parse_resolved_point(
+            &serde_json::json!({ "x": 1.0, "y": 2.0, "blocker": "div#cover2" }),
+            "#b",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("covered by <div#cover2>"), "{error}");
+        assert!(error.contains("Dismiss or interact"), "{error}");
+    }
+
+    #[test]
+    fn resolved_point_reports_reason_before_blocker_when_strict() {
+        let value = serde_json::json!({ "x": 1.0, "y": 2.0, "reason": "disabled", "blocker": "x" });
+        let error = parse_resolved_point(&value, "#b", true).unwrap_err();
+        assert!(error.contains("disabled"), "{error}");
+        let lenient = parse_resolved_point(&value, "#b", false).unwrap_err();
+        assert!(lenient.contains("covered by"), "{lenient}");
+    }
+
+    #[test]
+    fn resolved_point_returns_the_chosen_point() {
+        let value = serde_json::json!({ "x": 12.0, "y": 34.0, "size": 8.0 });
+        assert_eq!(
+            parse_resolved_point(&value, "#b", true).unwrap(),
+            Some(ResolvedPoint {
+                x: 12.0,
+                y: 34.0,
+                size: 8.0
+            })
+        );
+        assert_eq!(
+            parse_resolved_point(&Value::Null, "#b", true).unwrap(),
+            None
+        );
     }
 
     #[test]

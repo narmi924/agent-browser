@@ -1224,6 +1224,18 @@ pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
     if cmd.get("action").and_then(Value::as_str) == Some("mousemove") {
         op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
     }
+    if cmd.get("inputMode").and_then(Value::as_str) == Some("human") {
+        if let Some(text) = cmd.get("text").and_then(Value::as_str) {
+            let profile = crate::native::human::profile_named(
+                cmd.get("humanProfile").and_then(Value::as_str),
+            )
+            .unwrap_or(&crate::native::human::NATURAL);
+            op_ms = op_ms.max(crate::native::human::typing_budget_ms(
+                text.chars().count(),
+                profile,
+            ));
+        }
+    }
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
 }
 
@@ -1480,6 +1492,17 @@ mod tests {
         assert!(!is_read_only(&json!({"action": "evaluate"})));
         assert!(!is_read_only(&json!({"action": "some_future_action"})));
         assert!(!is_read_only(&json!({})));
+    }
+
+    #[test]
+    fn long_human_typing_gets_a_time_budget_for_its_text() {
+        let text = "a".repeat(2_000);
+        let human = read_timeout_for(
+            &json!({"action":"type", "text": text, "inputMode": "human", "humanProfile": "careful"}),
+        );
+        assert!(human > Duration::from_secs(600), "budget was {human:?}");
+        let plain = read_timeout_for(&json!({"action":"type", "text": text}));
+        assert_eq!(plain, Duration::from_secs(30));
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub mod downloads;
 #[allow(dead_code)]
 pub mod element;
 #[allow(dead_code)]
+pub mod human;
+#[allow(dead_code)]
 pub mod inspect_server;
 #[allow(dead_code)]
 pub mod interaction;
@@ -30,6 +32,8 @@ pub mod policy;
 pub mod providers;
 #[allow(dead_code)]
 pub mod react;
+#[allow(dead_code)]
+pub mod receipt;
 #[allow(dead_code)]
 pub mod recording;
 #[allow(dead_code)]

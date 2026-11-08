@@ -1081,8 +1081,16 @@
           },
           "human": {
             "default": false,
-            "description": "Approach the target with seeded, curved mouse movement.",
+            "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing.",
             "type": "boolean"
+          },
+          "humanProfile": {
+            "description": "Human input style. Defaults to natural.",
+            "enum": [
+              "natural",
+              "careful"
+            ],
+            "type": "string"
           },
           "idleTimeout": {
             "description": "Daemon idle timeout such as 30s, 5m, 1h, or raw milliseconds. Values too large to convert to milliseconds produce a warning and are ignored. Defaults to 1h; 0 disables idle shutdown.",
@@ -1128,6 +1136,11 @@
               "never"
             ],
             "type": "string"
+          },
+          "seed": {
+            "description": "Seed for reproducible human input.",
+            "minimum": 0,
+            "type": "integer"
           },
           "selector": {
             "description": "Element @ref from snapshot, or a CSS selector.",
@@ -3739,8 +3752,16 @@
           },
           "human": {
             "default": false,
-            "description": "Use seeded, curved mouse movement.",
+            "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing.",
             "type": "boolean"
+          },
+          "humanProfile": {
+            "description": "Human input style. Defaults to natural.",
+            "enum": [
+              "natural",
+              "careful"
+            ],
+            "type": "string"
           },
           "idleTimeout": {
             "description": "Daemon idle timeout such as 30s, 5m, 1h, or raw milliseconds. Values too large to convert to milliseconds produce a warning and are ignored. Defaults to 1h; 0 disables idle shutdown.",
@@ -3781,6 +3802,11 @@
               "never"
             ],
             "type": "string"
+          },
+          "seed": {
+            "description": "Seed for reproducible human input.",
+            "minimum": 0,
+            "type": "integer"
           },
           "session": {
             "description": "Optional isolated browser session name.",
@@ -4172,6 +4198,7 @@
               "role",
               "text",
               "label",
+              "near",
               "placeholder",
               "alt",
               "title",
@@ -4241,7 +4268,7 @@
             "type": "boolean"
           },
           "value": {
-            "description": "Role, text, label, selector, or test id.",
+            "description": "Role, text, label, nearby text, selector, or test id.",
             "type": "string"
           }
         },
@@ -5754,6 +5781,19 @@
             },
             "type": "array"
           },
+          "human": {
+            "default": false,
+            "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing.",
+            "type": "boolean"
+          },
+          "humanProfile": {
+            "description": "Human input style. Defaults to natural.",
+            "enum": [
+              "natural",
+              "careful"
+            ],
+            "type": "string"
+          },
           "idleTimeout": {
             "description": "Daemon idle timeout such as 30s, 5m, 1h, or raw milliseconds. Values too large to convert to milliseconds produce a warning and are ignored. Defaults to 1h; 0 disables idle shutdown.",
             "type": "string"
@@ -5793,6 +5833,11 @@
               "never"
             ],
             "type": "string"
+          },
+          "seed": {
+            "description": "Seed for reproducible human input.",
+            "minimum": 0,
+            "type": "integer"
           },
           "selector": {
             "description": "Element @ref from snapshot, or a CSS selector.",
@@ -6415,7 +6460,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Type text at the current focus using real key events.",
+      "description": "Type text at the current focus using real key events: keyDown, char, and keyUp for every character a key can produce, insertText only for the rest.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -6440,6 +6485,19 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "human": {
+            "default": false,
+            "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing.",
+            "type": "boolean"
+          },
+          "humanProfile": {
+            "description": "Human input style. Defaults to natural.",
+            "enum": [
+              "natural",
+              "careful"
+            ],
+            "type": "string"
           },
           "idleTimeout": {
             "description": "Daemon idle timeout such as 30s, 5m, 1h, or raw milliseconds. Values too large to convert to milliseconds produce a warning and are ignored. Defaults to 1h; 0 disables idle shutdown.",
@@ -6480,6 +6538,11 @@
               "never"
             ],
             "type": "string"
+          },
+          "seed": {
+            "description": "Seed for reproducible human input.",
+            "minimum": 0,
+            "type": "integer"
           },
           "session": {
             "description": "Optional isolated browser session name.",
@@ -6853,8 +6916,16 @@
           },
           "human": {
             "default": false,
-            "description": "Add a seeded perpendicular curve.",
+            "description": "Use the seeded human input model; with durationMs or steps, add a seeded perpendicular curve instead.",
             "type": "boolean"
+          },
+          "humanProfile": {
+            "description": "Human input style. Defaults to natural.",
+            "enum": [
+              "natural",
+              "careful"
+            ],
+            "type": "string"
           },
           "idleTimeout": {
             "description": "Daemon idle timeout such as 30s, 5m, 1h, or raw milliseconds. Values too large to convert to milliseconds produce a warning and are ignored. Defaults to 1h; 0 disables idle shutdown.",
@@ -13477,6 +13548,112 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
+      "description": "Bind the session to one already-open tab and pin it. Fails closed unless exactly one tab matches the URL (a partial match, or an exact match that beats partial ones) and optional title.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "allowedDomains": {
+            "description": "Restrict browser and read traffic to these domain patterns. Chromium sessions also disable RTCPeerConnection while this is active.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "caCert": {
+            "description": "Path to a CA certificate or PEM bundle. Trusted by the CLI's own HTTPS requests (read, install, upgrade, doctor), and by a locally launched Chromium browser on Linux.",
+            "type": "string"
+          },
+          "clearCaCert": {
+            "description": "Explicitly clear CA trust retained by the running browser session.",
+            "type": "boolean"
+          },
+          "extraArgs": {
+            "description": "Advanced: extra CLI arguments, including --engine chrome|lightpanda|obscura. Global flags that change network, file, policy, or host access (such as --allowed-domains, --executable-path, --args, --config) are rejected; set them in the MCP server environment or config. Obscura is experimental and rejects --proxy-bypass (including resolved config/environment settings). Explicit Obscura launches send this invocation's resolved bypass setting even to an existing daemon.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "idleTimeout": {
+            "description": "Daemon idle timeout such as 30s, 5m, 1h, or raw milliseconds. Values too large to convert to milliseconds produce a warning and are ignored. Defaults to 1h; 0 disables idle shutdown.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Optional namespace that isolates daemon sockets and restore-state directories.",
+            "type": "string"
+          },
+          "restore": {
+            "description": "Restore and auto-save browser state. true uses the current session as the key; a string uses that explicit key.",
+            "oneOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "restoreCheckFn": {
+            "description": "Optional JavaScript expression that must evaluate truthy after restore.",
+            "type": "string"
+          },
+          "restoreCheckText": {
+            "description": "Optional page text that restored state must expose.",
+            "type": "string"
+          },
+          "restoreCheckUrl": {
+            "description": "Optional URL pattern that restored state must match.",
+            "type": "string"
+          },
+          "restoreSave": {
+            "description": "Auto-save policy for restored state.",
+            "enum": [
+              "auto",
+              "always",
+              "never"
+            ],
+            "type": "string"
+          },
+          "session": {
+            "description": "Optional isolated browser session name.",
+            "type": "string"
+          },
+          "timeoutMs": {
+            "default": 120000,
+            "description": "Maximum time to wait for this tool call.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "title": {
+            "description": "Part of the tab title.",
+            "type": "string"
+          },
+          "url": {
+            "description": "URL or part of a URL.",
+            "type": "string"
+          },
+          "useSystemCa": {
+            "description": "Use the operating system trust store instead of the built-in roots for the CLI's own HTTPS requests. Does not affect the browser.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "name": "agent_browser_tab_claim",
+      "profiles": [
+        "core",
+        "tabs"
+      ],
+      "title": "Tab claim"
+    },
+    {
+      "annotations": {
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
       "description": "Close a tab by id (t1), label, or CDP target id. Omit to close the current tab.",
       "inputSchema": {
         "additionalProperties": false,
@@ -14296,9 +14473,27 @@
             },
             "type": "array"
           },
+          "human": {
+            "default": false,
+            "description": "Use the seeded human input model: curved path, minimum-jerk speed, pause before pressing.",
+            "type": "boolean"
+          },
+          "humanProfile": {
+            "description": "Human input style. Defaults to natural.",
+            "enum": [
+              "natural",
+              "careful"
+            ],
+            "type": "string"
+          },
           "idleTimeout": {
             "description": "Daemon idle timeout such as 30s, 5m, 1h, or raw milliseconds. Values too large to convert to milliseconds produce a warning and are ignored. Defaults to 1h; 0 disables idle shutdown.",
             "type": "string"
+          },
+          "keys": {
+            "default": false,
+            "description": "Send a full key press for every character a key can produce; use insertText only for characters no key produces, such as Chinese. Plain type inserts printable text.",
+            "type": "boolean"
           },
           "namespace": {
             "description": "Optional namespace that isolates daemon sockets and restore-state directories.",
@@ -14335,6 +14530,11 @@
               "never"
             ],
             "type": "string"
+          },
+          "seed": {
+            "description": "Seed for reproducible human input.",
+            "minimum": 0,
+            "type": "integer"
           },
           "selector": {
             "description": "Element @ref from snapshot, or a CSS selector.",

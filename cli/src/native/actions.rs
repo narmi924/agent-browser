@@ -28,15 +28,18 @@ use super::cookies;
 use super::diff;
 use super::downloads::{DownloadLedger, DownloadState};
 use super::element::RefMap;
+use super::human;
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
 use super::policy::{ActionPolicy, ConfirmActions, PolicyResult};
 use super::providers;
 use super::react;
+use super::receipt::{self, Expectation, ReceiptWatch, WatchScope};
 use super::recording::{self, RecordingState};
 use super::screenshot::{self, ScreenshotOptions};
 use super::snapshot::{self, SnapshotOptions};
+use super::snapshot::{FORM_CONTROL_SELECTOR_JSON, NEAR_TEXT_JS};
 use super::state;
 use super::storage;
 use super::stream::{self, IdleActivity, StreamServer};
@@ -757,6 +760,16 @@ pub struct DaemonState {
     active_provider_connection: bool,
     /// Actions already approved while replaying a confirmed command.
     confirmed_policy_actions: HashSet<String>,
+    /// `--adopt-tab`: an auto-connected session works in the tab the person
+    /// is looking at instead of a tab of its own.
+    pub adopt_tab: bool,
+    /// The next launch must not open a tab: `tab claim` is about to bind one.
+    pub skip_fresh_tab: bool,
+    /// A launch skipped its fresh tab and nothing has bound the session yet.
+    pub needs_fresh_tab: bool,
+    /// The blank tab this session opened when it attached, closed if the
+    /// session later claims another tab while this one is still unused.
+    pub fresh_tab_target: Option<String>,
     /// Strict session-to-tab binding (`--pin-tab` / AGENT_BROWSER_PIN_TAB).
     /// Sticky per session: persisted in the binding file so later commands
     /// and daemon restarts keep the strict semantics.
@@ -889,6 +902,13 @@ impl DaemonState {
             active_provider_connection: false,
             confirmed_policy_actions: HashSet::new(),
             pin_tab,
+            adopt_tab: matches!(
+                env::var("AGENT_BROWSER_ADOPT_TAB").as_deref(),
+                Ok("1" | "true" | "yes")
+            ),
+            skip_fresh_tab: false,
+            needs_fresh_tab: false,
+            fresh_tab_target: None,
             last_persisted_binding: None,
         }
     }
@@ -2897,6 +2917,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         let mut broadcast_cmd;
         let has_internal_fields = cmd.get("plugins").is_some()
             || cmd.get("pinTab").is_some()
+            || cmd.get("adoptTab").is_some()
+            || cmd.get("skipFreshTab").is_some()
             || cmd.get("restoreKey").is_some()
             || cmd.get("restoreSave").is_some()
             || cmd.get("restoreCheckUrl").is_some()
@@ -2907,6 +2929,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             if let Some(obj) = broadcast_cmd.as_object_mut() {
                 obj.remove("plugins");
                 obj.remove("pinTab");
+                obj.remove("adoptTab");
+                obj.remove("skipFreshTab");
                 obj.remove("restoreKey");
                 obj.remove("restoreSave");
                 obj.remove("restoreCheckUrl");
@@ -2928,6 +2952,12 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     // Keep element resolution in sync with the `frame` selection (see
     // element::set_active_frame for why this is mirrored).
     super::element::set_active_frame(state.active_frame_id.as_deref());
+
+    if let Some(adopt) = cmd.get("adoptTab").and_then(|v| v.as_bool()) {
+        state.adopt_tab = adopt;
+    }
+    state.skip_fresh_tab =
+        action == "tab_claim" || cmd.get("skipFreshTab").and_then(|v| v.as_bool()) == Some(true);
 
     // `--pin-tab` from the client enables strict tab binding even when the
     // daemon was started without the flag, and `--no-pin-tab` (pinTab: false)
@@ -3084,6 +3114,16 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         Err(err) => return error_response(&id, &err),
     };
 
+    if state.needs_fresh_tab
+        && !matches!(action, "tab_claim" | "tab_list" | "launch" | "close")
+        && !skip_launch
+    {
+        state.needs_fresh_tab = false;
+        if let Err(e) = open_fresh_tab_for_auto_connect(state).await {
+            return error_response(&id, &e);
+        }
+    }
+
     if !skip_launch {
         if needs_launch {
             lifecycle_relaunched_browser = restore_transition_closed_browser
@@ -3163,6 +3203,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     | "tab_new"
                     | "tab_switch"
                     | "tab_close"
+                    | "tab_claim"
             );
         if on_active_tab && !safe_during_dialog {
             return error_response(
@@ -3247,6 +3288,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "tab_new" => handle_tab_new(cmd, state).await,
         "tab_switch" => handle_tab_switch(cmd, state).await,
         "tab_close" => handle_tab_close(cmd, state).await,
+        "tab_claim" => handle_tab_claim(cmd, state).await,
         "viewport" => handle_viewport(cmd, state).await,
         "useragent" | "user_agent" => handle_user_agent(cmd, state).await,
         "set_media" => handle_set_media(cmd, state).await,
@@ -3316,6 +3358,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "getbyalttext" => handle_getbyalttext(cmd, state).await,
         "getbytitle" => handle_getbytitle(cmd, state).await,
         "getbytestid" => handle_getbytestid(cmd, state).await,
+        "getbynear" => handle_getbynear(cmd, state).await,
         "nth" => handle_nth(cmd, state).await,
         "find" => handle_find(cmd, state).await,
         "evalhandle" => handle_evalhandle(cmd, state).await,
@@ -3606,11 +3649,17 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
             }
         }
         None => {
-            if pin {
+            if pin && state.skip_fresh_tab {
+                // `tab claim` binds the tab itself; opening one here would
+                // only flash a blank tab at the person.
+                state.needs_fresh_tab = true;
+                false
+            } else if pin {
                 // A pinned session never implicitly adopts an existing tab:
                 // start it on a fresh one.
                 if let Some(ref mut mgr) = state.browser {
                     mgr.tab_new(None, None).await?;
+                    state.fresh_tab_target = mgr.active_target_id().ok().map(str::to_string);
                 }
                 true
             } else {
@@ -3665,9 +3714,34 @@ async fn open_fresh_tab_for_auto_connect(state: &mut DaemonState) -> Result<(), 
         .client
         .send_command("Page.bringToFront", None, Some(&session_id))
         .await;
+    state.fresh_tab_target = mgr.active_target_id().ok().map(str::to_string);
     // Best effort: a failed write is retried after the next command.
     let _ = maybe_persist_tab_binding(state);
     Ok(())
+}
+
+/// Decide which tab an auto-connected session works in. By default it gets
+/// (or re-binds to) a tab of its own and never touches the tab the person is
+/// looking at. `--adopt-tab` is the explicit request to work in that tab.
+async fn bind_auto_connected_tab(state: &mut DaemonState) -> Result<(), String> {
+    if state.adopt_tab {
+        tab_binding::clear(&state.session_id);
+        state.last_persisted_binding = None;
+        if let Some(ref mut mgr) = state.browser {
+            mgr.adopt_visible_tab().await?;
+        }
+        // Best effort: a failed write is retried after the next command.
+        let _ = maybe_persist_tab_binding(state);
+        return Ok(());
+    }
+    if apply_tab_binding_on_attach(state).await? {
+        return Ok(());
+    }
+    if state.skip_fresh_tab {
+        state.needs_fresh_tab = true;
+        return Ok(());
+    }
+    open_fresh_tab_for_auto_connect(state).await
 }
 
 async fn current_allowed_domains(state: &DaemonState) -> Vec<String> {
@@ -4464,11 +4538,9 @@ async fn auto_launch_inner(
         );
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_auto().await?);
-        if !apply_tab_binding_on_attach_or_rollback(state).await? {
-            if let Err(e) = open_fresh_tab_for_auto_connect(state).await {
-                let _ = rollback_failed_launch(state).await;
-                return Err(e);
-            }
+        if let Err(e) = bind_auto_connected_tab(state).await {
+            let _ = rollback_failed_launch(state).await;
+            return Err(e);
         }
         state.launch_hash = Some(hash);
         state.subscribe_to_browser_events();
@@ -5481,11 +5553,9 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     if auto_connect {
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_auto().await?);
-        if !apply_tab_binding_on_attach_or_rollback(state).await? {
-            if let Err(e) = open_fresh_tab_for_auto_connect(state).await {
-                let _ = rollback_failed_launch(state).await;
-                return Err(e);
-            }
+        if let Err(e) = bind_auto_connected_tab(state).await {
+            let _ = rollback_failed_launch(state).await;
+            return Err(e);
         }
         state.launch_hash = Some(new_hash);
         state.subscribe_to_browser_events();
@@ -6112,6 +6182,9 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             let mut obj = serde_json::Map::new();
             obj.insert("role".into(), Value::String(entry.role));
             obj.insert("name".into(), Value::String(entry.name));
+            if let Some(near) = entry.near {
+                obj.insert("near".into(), Value::String(near));
+            }
             (ref_id, Value::Object(obj))
         })
         .collect();
@@ -6518,7 +6591,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.click(selector).await?;
-            return Ok(json!({ "clicked": selector }));
+            return Ok(json!({ "clicked": selector, "receipt": receipt::unobserved() }));
         }
     }
 
@@ -6595,71 +6668,214 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
         state.refresh_active_iframe_sessions().await;
 
-        return Ok(json!({ "clicked": selector, "newTab": true, "url": href }));
+        return Ok(json!({
+            "clicked": selector,
+            "newTab": true,
+            "url": href,
+            "receipt": receipt::new_tab_opened(&href),
+        }));
     }
 
-    let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+    let button = cmd
+        .get("button")
+        .and_then(|v| v.as_str())
+        .unwrap_or("left")
+        .to_string();
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+    click_with_receipt(cmd, state, selector, &button, click_count).await
+}
 
+/// Build the observer for a receipt on the element `selector` resolves to.
+async fn watch_element(
+    state: &DaemonState,
+    session_id: &str,
+    selector: &str,
+    mode: &str,
+) -> Result<ReceiptWatch, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let page = mgr.binding_snapshot();
+    let scope = WatchScope {
+        client: &mgr.client,
+        page_session: session_id,
+        page_target: page.as_ref().map(|p| p.0.as_str()),
+        page_url: page.as_ref().map(|p| p.1.as_str()),
+        ref_map: &state.ref_map,
+        iframe_sessions: &state.iframe_sessions,
+    };
+    Ok(ReceiptWatch::on_element(&scope, selector, mode).await)
+}
+
+/// A seeded human-input model for one command, when it asked for one.
+struct HumanInput {
+    profile: &'static human::HumanProfile,
+    rng: human::HumanRng,
+}
+
+/// The human model for a pointer command: an explicit `--human` or the
+/// session's `--input-mode human`.
+fn human_pointer_input(cmd: &Value, session_mode: &str) -> Result<Option<HumanInput>, String> {
+    let mode = cmd
+        .get("inputMode")
+        .and_then(Value::as_str)
+        .unwrap_or(session_mode);
+    if mode != "human" {
+        return Ok(None);
+    }
+    human_input_from(cmd).map(Some)
+}
+
+/// The human model for typing: only an explicit `--human`, because typing
+/// has to use key events, which Electron webviews can reject.
+fn human_typing_input(cmd: &Value) -> Result<Option<HumanInput>, String> {
+    if cmd.get("inputMode").and_then(Value::as_str) != Some("human") {
+        return Ok(None);
+    }
+    human_input_from(cmd).map(Some)
+}
+
+fn human_input_from(cmd: &Value) -> Result<HumanInput, String> {
+    let requested = cmd.get("humanProfile").and_then(Value::as_str);
+    let profile = human::profile_named(requested).ok_or_else(|| {
+        format!(
+            "Unknown --human profile '{}'. Valid profiles: natural, careful.",
+            requested.unwrap_or_default()
+        )
+    })?;
+    let seed = cmd
+        .get("seed")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(human::HumanRng::fresh_seed);
+    Ok(HumanInput {
+        profile,
+        rng: human::HumanRng::new(seed),
+    })
+}
+
+async fn click_with_receipt(
+    cmd: &Value,
+    state: &mut DaemonState,
+    selector: &str,
+    button: &str,
+    click_count: i32,
+) -> Result<Value, String> {
+    let session_id = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .active_session_id()?
+        .to_string();
+    let mut human = human_pointer_input(cmd, &state.input_mode)?;
     let input_mode = cmd
         .get("inputMode")
         .and_then(Value::as_str)
-        .unwrap_or(&state.input_mode);
-    if input_mode != "instant" {
-        let (x, y, target_session_id) = super::element::resolve_element_center(
+        .unwrap_or(&state.input_mode)
+        .to_string();
+    let watch = watch_element(state, &session_id, selector, "click").await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+
+    let result = if let Some(input) = human.as_mut() {
+        let jitter = human::plan_landing_jitter(&mut input.rng);
+        let point = super::element::resolve_element_point(
             &mgr.client,
             &session_id,
             &state.ref_map,
             selector,
             &state.iframe_sessions,
             true,
+            Some(jitter),
         )
         .await?;
         let offset = super::element::session_viewport_offset(
             &mgr.client,
             &session_id,
-            &target_session_id,
+            &point.session_id,
             &state.iframe_sessions,
         )
         .await?;
-        move_mouse_interpolated(
+        move_mouse_human(
             &mgr.client,
-            &target_session_id,
             &mut state.mouse_state,
-            x,
-            y,
-            if input_mode == "smooth" { 200 } else { 0 },
-            None,
-            input_mode == "human",
-            cmd.get("seed").and_then(Value::as_u64).unwrap_or(0),
-            0,
-            offset,
+            HumanMove {
+                session_id: &point.session_id,
+                to: (point.x, point.y),
+                target_size: point.target_size,
+                buttons: 0,
+                viewport_offset: offset,
+            },
+            input,
             &state.recording_state.shared_cursor,
         )
         .await?;
-    }
-
-    let result = interaction::click(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        selector,
-        button,
-        click_count,
-        &state.iframe_sessions,
-    )
-    .await?;
+        let pacing = interaction::ClickPacing {
+            skip_move: true,
+            pre_press_ms: human::plan_pre_press_ms(input.profile, &mut input.rng),
+            hold_ms: human::plan_hold_ms(input.profile, &mut input.rng),
+        };
+        interaction::click_at_point(&mgr.client, &session_id, &point, offset, pacing).await?
+    } else {
+        if input_mode != "instant" {
+            let (x, y, target_session_id) = super::element::resolve_element_center(
+                &mgr.client,
+                &session_id,
+                &state.ref_map,
+                selector,
+                &state.iframe_sessions,
+                true,
+            )
+            .await?;
+            let offset = super::element::session_viewport_offset(
+                &mgr.client,
+                &session_id,
+                &target_session_id,
+                &state.iframe_sessions,
+            )
+            .await?;
+            move_mouse_interpolated(
+                &mgr.client,
+                &target_session_id,
+                &mut state.mouse_state,
+                x,
+                y,
+                200,
+                None,
+                false,
+                0,
+                0,
+                offset,
+                &state.recording_state.shared_cursor,
+            )
+            .await?;
+        }
+        interaction::click(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            button,
+            click_count,
+            &state.iframe_sessions,
+        )
+        .await?
+    };
     record_click_animation(
         &result,
         &mut state.mouse_state,
         &state.recording_state.shared_cursor,
     );
 
+    let receipt = watch
+        .finish(
+            &mgr.client,
+            Expectation::Click,
+            result.dialog_opened,
+            receipt::CLICK_SETTLE,
+        )
+        .await;
     if result.dialog_opened {
         state.pending_pointer_release = result.pending_release;
-        return Ok(json!({ "clicked": selector, "dialogOpened": true }));
+        return Ok(json!({ "clicked": selector, "dialogOpened": true, "receipt": receipt }));
     }
-    Ok(json!({ "clicked": selector }))
+    Ok(json!({ "clicked": selector, "receipt": receipt }))
 }
 
 async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -6670,6 +6886,7 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let watch = watch_element(state, &session_id, selector, "click").await?;
     let result = interaction::dblclick(
         &mgr.client,
         &session_id,
@@ -6683,11 +6900,19 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &mut state.mouse_state,
         &state.recording_state.shared_cursor,
     );
+    let receipt = watch
+        .finish(
+            &mgr.client,
+            Expectation::Click,
+            result.dialog_opened,
+            receipt::CLICK_SETTLE,
+        )
+        .await;
     if result.dialog_opened {
         state.pending_pointer_release = result.pending_release;
-        return Ok(json!({ "clicked": selector, "dialogOpened": true }));
+        return Ok(json!({ "clicked": selector, "dialogOpened": true, "receipt": receipt }));
     }
-    Ok(json!({ "clicked": selector }))
+    Ok(json!({ "clicked": selector, "receipt": receipt }))
 }
 
 async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -6703,13 +6928,26 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.fill(selector, value).await?;
-            return Ok(json!({ "filled": selector }));
+            return Ok(json!({ "filled": selector, "receipt": receipt::unobserved() }));
         }
     }
 
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    fill_with_receipt(state, selector, value).await
+}
 
+async fn fill_with_receipt(
+    state: &mut DaemonState,
+    selector: &str,
+    value: &str,
+) -> Result<Value, String> {
+    let session_id = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .active_session_id()?
+        .to_string();
+    let watch = watch_element(state, &session_id, selector, "value").await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     interaction::fill(
         &mgr.client,
         &session_id,
@@ -6719,12 +6957,24 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         &state.iframe_sessions,
     )
     .await?;
-    Ok(json!({ "filled": selector }))
+    let receipt = watch
+        .finish(
+            &mgr.client,
+            Expectation::Value(value),
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+    Ok(json!({ "filled": selector, "receipt": receipt }))
 }
 
 async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let session_id = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .active_session_id()?
+        .to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -6735,19 +6985,52 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         .ok_or("Missing 'text' parameter")?;
     let clear = cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
     let delay = cmd.get("delay").and_then(|v| v.as_u64());
+    let keys = cmd.get("keys").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut human = human_typing_input(cmd)?;
 
-    interaction::type_text(
+    let watch = watch_element(state, &session_id, selector, "value").await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    interaction::prepare_type_target(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
-        text,
         clear,
-        delay,
         &state.iframe_sessions,
     )
     .await?;
-    Ok(json!({ "typed": text }))
+    watch.capture_typing_baseline(&mgr.client, text).await;
+    if let Some(input) = human.as_mut() {
+        type_like_a_person(&mgr.client, &session_id, text, input, &watch).await?;
+    } else if keys {
+        interaction::type_keys_into_active_context(&mgr.client, &session_id, text, delay).await?;
+    } else {
+        interaction::type_text_into_active_context(&mgr.client, &session_id, text, delay).await?;
+    }
+    let receipt = watch
+        .finish(
+            &mgr.client,
+            Expectation::Typed(text),
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+    Ok(json!({ "typed": text, "receipt": receipt }))
+}
+
+/// Plan and run human-paced typing for `text`, with deliberate mistakes only
+/// in fields that are safe to make them in.
+async fn type_like_a_person(
+    client: &CdpClient,
+    session_id: &str,
+    text: &str,
+    input: &mut HumanInput,
+    watch: &ReceiptWatch,
+) -> Result<(), String> {
+    let allow_typos = !watch.is_sensitive_field(client).await;
+    let plan = human::plan_typing(text, input.profile, allow_typos, &mut input.rng);
+    let _timer = human::PreciseTimerGuard::new();
+    interaction::run_typing_plan(client, session_id, &plan).await
 }
 
 async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -6806,14 +7089,57 @@ fn parse_key_chord(input: &str) -> (String, Option<i32>) {
 }
 
 async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    hover_element(cmd, state, selector).await
+}
 
-    let position = interaction::hover(
+async fn hover_element(
+    cmd: &Value,
+    state: &mut DaemonState,
+    selector: &str,
+) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    if let Some(mut input) = human_pointer_input(cmd, &state.input_mode)? {
+        let jitter = human::plan_landing_jitter(&mut input.rng);
+        let point = super::element::resolve_element_point(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+            false,
+            Some(jitter),
+        )
+        .await?;
+        let offset = super::element::session_viewport_offset(
+            &mgr.client,
+            &session_id,
+            &point.session_id,
+            &state.iframe_sessions,
+        )
+        .await?;
+        let buttons = state.mouse_state.buttons;
+        move_mouse_human(
+            &mgr.client,
+            &mut state.mouse_state,
+            HumanMove {
+                session_id: &point.session_id,
+                to: (point.x, point.y),
+                target_size: point.target_size,
+                buttons,
+                viewport_offset: offset,
+            },
+            &mut input,
+            &state.recording_state.shared_cursor,
+        )
+        .await?;
+        return Ok(json!({ "hovered": selector }));
+    }
+    let outcome = interaction::hover(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -6821,9 +7147,24 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.iframe_sessions,
     )
     .await?;
+    let position = outcome.position;
     (state.mouse_state.x, state.mouse_state.y) = position;
     if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
         cursor.record(position.0, position.1, state.mouse_state.buttons);
+    }
+    if !outcome.acknowledged {
+        let hidden = mgr
+            .evaluate("document.visibilityState === 'hidden'", None)
+            .await
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if hidden {
+            return Ok(json!({
+                "hovered": selector,
+                "note": "The tab is hidden, so Chrome holds hover events until the next click or until it renders."
+            }));
+        }
     }
     Ok(json!({ "hovered": selector }))
 }
@@ -6883,6 +7224,7 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .unwrap_or_default(),
     };
 
+    let watch = watch_element(state, &session_id, selector, "value").await?;
     interaction::select_option(
         &mgr.client,
         &session_id,
@@ -6892,57 +7234,96 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         &state.iframe_sessions,
     )
     .await?;
-    Ok(json!({ "selected": values }))
+    let receipt = watch
+        .finish(
+            &mgr.client,
+            Expectation::Selected(&values),
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+    Ok(json!({ "selected": values, "receipt": receipt }))
 }
 
 async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
-
-    if let Some(position) = interaction::check(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        selector,
-        &state.iframe_sessions,
-    )
-    .await?
-    {
-        (state.mouse_state.x, state.mouse_state.y) = position;
-        if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
-            cursor.record(position.0, position.1, state.mouse_state.buttons);
-        }
-    }
-    Ok(json!({ "checked": selector }))
+    set_checked_with_receipt(state, selector, true).await
 }
 
 async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    set_checked_with_receipt(state, selector, false).await
+}
 
-    if let Some(position) = interaction::uncheck(
+async fn set_checked_with_receipt(
+    state: &mut DaemonState,
+    selector: &str,
+    checked: bool,
+) -> Result<Value, String> {
+    let session_id = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .active_session_id()?
+        .to_string();
+    let watch = watch_element(state, &session_id, selector, "click").await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let position = if checked {
+        interaction::check(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+        )
+        .await?
+    } else {
+        interaction::uncheck(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+        )
+        .await?
+    };
+    if let Some(position) = position {
+        (state.mouse_state.x, state.mouse_state.y) = position;
+        if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+            cursor.record(position.0, position.1, state.mouse_state.buttons);
+        }
+    }
+    let actual = super::element::is_element_checked(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
     )
-    .await?
-    {
-        (state.mouse_state.x, state.mouse_state.y) = position;
-        if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
-            cursor.record(position.0, position.1, state.mouse_state.buttons);
-        }
+    .await
+    .ok();
+    let receipt = watch
+        .finish(
+            &mgr.client,
+            Expectation::Checked {
+                expected: checked,
+                actual,
+            },
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+    if checked {
+        Ok(json!({ "checked": selector, "receipt": receipt }))
+    } else {
+        Ok(json!({ "unchecked": selector, "receipt": receipt }))
     }
-    Ok(json!({ "unchecked": selector }))
 }
 
 async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -7825,9 +8206,32 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'text' parameter")?;
-            interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
-                .await?;
-            return Ok(json!({ "typed": text }));
+            let page = mgr.binding_snapshot();
+            let scope = WatchScope {
+                client: &mgr.client,
+                page_session: &session_id,
+                page_target: page.as_ref().map(|p| p.0.as_str()),
+                page_url: page.as_ref().map(|p| p.1.as_str()),
+                ref_map: &state.ref_map,
+                iframe_sessions: &state.iframe_sessions,
+            };
+            let watch = ReceiptWatch::on_focused(&scope).await;
+            watch.capture_typing_baseline(&mgr.client, text).await;
+            if let Some(mut input) = human_typing_input(cmd)? {
+                type_like_a_person(&mgr.client, &session_id, text, &mut input, &watch).await?;
+            } else {
+                interaction::type_keys_into_active_context(&mgr.client, &session_id, text, None)
+                    .await?;
+            }
+            let receipt = watch
+                .finish(
+                    &mgr.client,
+                    Expectation::Typed(text),
+                    false,
+                    std::time::Duration::ZERO,
+                )
+                .await;
+            return Ok(json!({ "typed": text, "receipt": receipt }));
         }
         Some("insertText") => {
             let text = cmd
@@ -7999,6 +8403,67 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
         }
     }
 
+    Ok(result)
+}
+
+/// Bind the session to one already-open tab, chosen by URL (and optionally
+/// title), and pin it. Fails closed unless exactly one tab matches.
+async fn handle_tab_claim(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let url = cmd
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'url' parameter")?;
+    let title = cmd.get("title").and_then(|v| v.as_str());
+    // On failure the pending fresh tab stays pending, so the next command
+    // that touches a page opens one instead of using the person's tab.
+    claim_open_tab(state, url, title).await
+}
+
+async fn claim_open_tab(
+    state: &mut DaemonState,
+    url: &str,
+    title: Option<&str>,
+) -> Result<Value, String> {
+    let dialog_session = state
+        .pending_dialog
+        .as_ref()
+        .and_then(|d| d.session_id.clone());
+    let session_name = state.session_id.clone();
+    let result = {
+        let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+        mgr.claim_open_tab(url, title, &session_name, dialog_session.as_deref())
+            .await?
+    };
+    state.needs_fresh_tab = false;
+    state.ref_map.begin_snapshot();
+    state.active_iframe_sessions.clear();
+    state.active_frame_id = None;
+    state.webmcp.clear_invocations();
+    state.pin_tab = true;
+    if let Some(ref mut mgr) = state.browser {
+        mgr.set_pin_tab(true);
+    }
+    state.last_persisted_binding = None;
+    if let Some(err) = maybe_persist_tab_binding(state) {
+        return Err(format!(
+            "tab claimed but the pin could not be saved: {}. The claim is not durable, so it was refused",
+            err
+        ));
+    }
+    // The claimed tab replaces the blank tab this session opened on attach.
+    let claimed_target = result.get("targetId").and_then(|v| v.as_str());
+    if let Some(blank) = state
+        .fresh_tab_target
+        .take()
+        .filter(|blank| Some(blank.as_str()) != claimed_target)
+    {
+        if let Some(ref mut mgr) = state.browser {
+            mgr.close_tab_if_blank(&blank).await;
+        }
+    }
+    let has_proxy_creds = state.proxy_credentials.read().await.is_some();
+    install_network_controls_or_close(state, has_proxy_creds).await?;
+    state.refresh_active_iframe_sessions().await;
     Ok(result)
 }
 
@@ -8972,9 +9437,19 @@ async fn handle_upload(cmd: &Value, state: &DaemonState) -> Result<Value, String
         })
         .unwrap_or_default();
 
+    let session_id = mgr.active_session_id()?.to_string();
+    let watch = watch_element(state, &session_id, selector, "value").await?;
     mgr.upload_files(selector, &files, &state.ref_map, &state.iframe_sessions)
         .await?;
-    Ok(json!({ "uploaded": files.len(), "selector": selector }))
+    let receipt = watch
+        .finish(
+            &mgr.client,
+            Expectation::Files(&files),
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+    Ok(json!({ "uploaded": files.len(), "selector": selector, "receipt": receipt }))
 }
 
 async fn handle_addscript(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
@@ -10325,6 +10800,7 @@ const FIND_ACTIONS: &[&str] = &["click", "fill", "check", "hover", "text"];
 /// The daemon commands that dispatch a `find` subaction through
 /// `execute_subaction` after resolving their locator.
 const FIND_SUBACTION_COMMANDS: &[&str] = &[
+    "getbynear",
     "getbyrole",
     "getbytext",
     "getbylabel",
@@ -10384,76 +10860,16 @@ async fn execute_subaction(
     let session_id = mgr.active_session_id()?.to_string();
 
     match subaction {
-        "click" => {
-            let result = interaction::click(
-                &mgr.client,
-                &session_id,
-                &state.ref_map,
-                selector,
-                "left",
-                1,
-                &state.iframe_sessions,
-            )
-            .await?;
-            record_click_animation(
-                &result,
-                &mut state.mouse_state,
-                &state.recording_state.shared_cursor,
-            );
-            if result.dialog_opened {
-                state.pending_pointer_release = result.pending_release;
-                return Ok(json!({ "clicked": selector, "dialogOpened": true }));
-            }
-            Ok(json!({ "clicked": selector }))
-        }
+        "click" => click_with_receipt(cmd, state, selector, "left", 1).await,
         "fill" => {
             let value = cmd
                 .get("value")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'value' for fill subaction")?;
-            interaction::fill(
-                &mgr.client,
-                &session_id,
-                &state.ref_map,
-                selector,
-                value,
-                &state.iframe_sessions,
-            )
-            .await?;
-            Ok(json!({ "filled": selector }))
+            fill_with_receipt(state, selector, value).await
         }
-        "check" => {
-            if let Some(position) = interaction::check(
-                &mgr.client,
-                &session_id,
-                &state.ref_map,
-                selector,
-                &state.iframe_sessions,
-            )
-            .await?
-            {
-                (state.mouse_state.x, state.mouse_state.y) = position;
-                if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
-                    cursor.record(position.0, position.1, state.mouse_state.buttons);
-                }
-            }
-            Ok(json!({ "checked": selector }))
-        }
-        "hover" => {
-            let position = interaction::hover(
-                &mgr.client,
-                &session_id,
-                &state.ref_map,
-                selector,
-                &state.iframe_sessions,
-            )
-            .await?;
-            (state.mouse_state.x, state.mouse_state.y) = position;
-            if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
-                cursor.record(position.0, position.1, state.mouse_state.buttons);
-            }
-            Ok(json!({ "hovered": selector }))
-        }
+        "check" => set_checked_with_receipt(state, selector, true).await,
+        "hover" => hover_element(cmd, state, selector).await,
         "text" => {
             let text = super::element::get_element_text(
                 &mgr.client,
@@ -10875,38 +11291,6 @@ async fn handle_semantic_locator(
     };
 
     let query = match strategy {
-        // Like Playwright's getByLabel: match <label> associations AND
-        // aria-label / aria-labelledby. Icon buttons and custom controls
-        // are usually labelled via aria-label only.
-        "label" => {
-            let value_json = serde_json::to_string(value).unwrap_or_default();
-            let matches_fn = if exact {
-                format!("(s) => !!s && s.trim() === {value_json}")
-            } else {
-                format!("(s) => !!s && s.includes({value_json})")
-            };
-            format!(
-                r#"(() => {{
-                const matches = {matches_fn};
-                const label = Array.from(document.querySelectorAll('label')).find(el => matches(el.textContent));
-                if (label) {{
-                    const forId = label.getAttribute('for');
-                    const target = forId ? document.getElementById(forId) : label.querySelector('input,select,textarea');
-                    if (target) {{ target.setAttribute('data-agent-browser-located', 'true'); return true; }}
-                }}
-                const aria = Array.from(document.querySelectorAll('[aria-label]')).find(el => matches(el.getAttribute('aria-label')));
-                if (aria) {{ aria.setAttribute('data-agent-browser-located', 'true'); return true; }}
-                const referenced = Array.from(document.querySelectorAll('[aria-labelledby]')).find(el => {{
-                    const text = el.getAttribute('aria-labelledby').split(/\s+/)
-                        .map(id => {{ const r = document.getElementById(id); return r ? r.textContent : ''; }})
-                        .join(' ');
-                    return matches(text);
-                }});
-                if (referenced) {{ referenced.setAttribute('data-agent-browser-located', 'true'); return true; }}
-                return false;
-            }})()"#,
-            )
-        }
         "placeholder" => format!(
             r#"(() => {{
                 const el = document.querySelector('input[placeholder={val}], textarea[placeholder={val}]');
@@ -11000,7 +11384,151 @@ async fn handle_getbytext(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 }
 
 async fn handle_getbylabel(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    handle_semantic_locator(cmd, state, "label", "label").await
+    locate_control_and_act(cmd, state, "label", "label").await
+}
+
+async fn handle_getbynear(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    locate_control_and_act(cmd, state, "near", "text").await
+}
+
+/// Locate one form control by its label or by the text beside it, then run
+/// the find action on it. Strategies are tried in order of authority, so plain
+/// adjacent text is only used when no real label matches. Within a strategy
+/// an exact match (ignoring trailing `:`, `：`, `*`) beats a partial one, and
+/// more than one equally good match is an error: acting on a guess is worse
+/// than asking for a more specific locator.
+async fn locate_control_and_act(
+    cmd: &Value,
+    state: &mut DaemonState,
+    strategy: &str,
+    param_name: &str,
+) -> Result<Value, String> {
+    let value = cmd
+        .get(param_name)
+        .and_then(|v| v.as_str())
+        .ok_or(format!("Missing '{}' parameter", param_name))?;
+    let exact = cmd.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+    let body = control_locator_js(strategy, value, exact);
+    let located = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        let top_session = mgr.active_session_id()?.to_string();
+        eval_body_in_active_frame(
+            mgr,
+            state.active_frame_id.as_deref(),
+            &top_session,
+            &state.iframe_sessions,
+            &body,
+        )
+        .await?
+    };
+    match located.get("status").and_then(|v| v.as_str()) {
+        Some("found") => {}
+        Some("ambiguous") => {
+            let count = located.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let shown = located
+                .get("matches")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            return Err(format!(
+                "'{value}' matches {count} controls ({shown}). Use a more specific text, --exact, or a ref from `snapshot -i`."
+            ));
+        }
+        _ => {
+            return Err(if strategy == "near" {
+                format!("No form control found near text '{}'", value)
+            } else {
+                format!("No element found by label '{}'", value)
+            });
+        }
+    }
+    let selector = "[data-agent-browser-located='true']";
+    let action_result = execute_subaction(cmd, state, selector).await;
+    if let Some(mgr) = state.browser.as_ref() {
+        if let Ok(top_session) = mgr.active_session_id() {
+            let top_session = top_session.to_string();
+            let _ = eval_body_in_active_frame(
+                mgr,
+                state.active_frame_id.as_deref(),
+                &top_session,
+                &state.iframe_sessions,
+                "(root) => { root.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located'); }",
+            )
+            .await;
+        }
+    }
+    action_result
+}
+
+/// Page-side search behind `find label` and `find near`, as a
+/// `(root) => result` body for `eval_body_in_active_frame`.
+fn control_locator_js(strategy: &str, value: &str, exact: bool) -> String {
+    let value_json = serde_json::to_string(value).unwrap_or_default();
+    let tiers = if strategy == "near" {
+        "[nearTier]"
+    } else {
+        "[labelTier, ariaLabelTier, labelledByTier, nearTier]"
+    };
+    format!(
+        r#"(root) => {{
+            const query = {value_json};
+            const exact = {exact};
+            const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const clean = (s) => norm(s).replace(/[\s:：*＊]+$/u, '').trim();
+            const wanted = clean(query);
+            if (!wanted) return {{ status: 'missing' }};
+            const score = (text) => {{
+                const t = clean(text);
+                if (!t) return 0;
+                if (t === wanted) return 2;
+                if (exact) return 0;
+                return t.toLowerCase().includes(wanted.toLowerCase()) ? 1 : 0;
+            }};
+            const CONTROLS = {FORM_CONTROL_SELECTOR_JSON};
+            const nearText = {NEAR_TEXT_JS};
+            const labelTier = () => Array.from(root.querySelectorAll('label')).map((label) => {{
+                const forId = label.getAttribute('for');
+                const target = forId
+                    ? root.getElementById(forId)
+                    : label.querySelector(CONTROLS);
+                return [target, score(label.textContent)];
+            }}).filter((entry) => entry[0]);
+            const ariaLabelTier = () => Array.from(root.querySelectorAll('[aria-label]'))
+                .map((el) => [el, score(el.getAttribute('aria-label'))]);
+            const labelledByTier = () => Array.from(root.querySelectorAll('[aria-labelledby]')).map((el) => {{
+                const text = el.getAttribute('aria-labelledby').split(/\s+/)
+                    .map((id) => {{ const r = root.getElementById(id); return r ? r.textContent : ''; }})
+                    .join(' ');
+                return [el, score(text)];
+            }});
+            const nearTier = () => Array.from(root.querySelectorAll(CONTROLS)).map((el) => {{
+                const near = nearText(el);
+                return [el, near ? score(near) : 0];
+            }});
+            const describe = (el) => {{
+                const tag = el.tagName.toLowerCase();
+                return el.id ? tag + '#' + el.id : (el.name ? tag + '[name=' + el.name + ']' : tag);
+            }};
+            for (const tier of {tiers}) {{
+                const entries = tier().filter((entry) => entry[1] > 0);
+                if (!entries.length) continue;
+                const best = Math.max(...entries.map((entry) => entry[1]));
+                const matched = Array.from(new Set(entries.filter((entry) => entry[1] === best).map((entry) => entry[0])));
+                if (matched.length > 1) {{
+                    return {{ status: 'ambiguous', count: matched.length, matches: matched.slice(0, 5).map(describe) }};
+                }}
+                matched[0].setAttribute('data-agent-browser-located', 'true');
+                return {{ status: 'found' }};
+            }}
+            return {{ status: 'missing' }};
+        }}"#
+    )
 }
 
 async fn handle_getbyplaceholder(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -11138,8 +11666,6 @@ async fn handle_evalhandle(cmd: &Value, state: &DaemonState) -> Result<Value, St
 // ---------------------------------------------------------------------------
 
 async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let source = cmd
         .get("source")
         .and_then(|v| v.as_str())
@@ -11148,68 +11674,103 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         .get("target")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'target' parameter")?;
+    let session_id = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .active_session_id()?
+        .to_string();
+    let mut human = human_pointer_input(cmd, &state.input_mode)?;
+    let watch = watch_element(state, &session_id, target, "drop").await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
 
-    let (sx, sy, source_session_id) = super::element::resolve_element_center(
+    let source_jitter = human
+        .as_mut()
+        .map(|input| human::plan_landing_jitter(&mut input.rng));
+    let target_jitter = human
+        .as_mut()
+        .map(|input| human::plan_landing_jitter(&mut input.rng));
+    let source_point = super::element::resolve_element_point(
         &mgr.client,
         &session_id,
         &state.ref_map,
         source,
         &state.iframe_sessions,
         false,
+        source_jitter,
     )
     .await?;
-    let (tx, ty, target_session_id) = super::element::resolve_element_center(
+    let target_point = super::element::resolve_element_point(
         &mgr.client,
         &session_id,
         &state.ref_map,
         target,
         &state.iframe_sessions,
         false,
+        target_jitter,
     )
     .await?;
-
-    let mode = cmd
-        .get("inputMode")
-        .and_then(Value::as_str)
-        .unwrap_or(&state.input_mode);
-    let human = mode == "human";
-    let seed = cmd.get("seed").and_then(Value::as_u64).unwrap_or(0);
+    let (sx, sy) = (source_point.x, source_point.y);
+    let (tx, ty) = (target_point.x, target_point.y);
 
     // Approach the source before pressing so hover and pointer path handlers fire.
     let source_offset = super::element::session_viewport_offset(
         &mgr.client,
         &session_id,
-        &source_session_id,
+        &source_point.session_id,
         &state.iframe_sessions,
     )
     .await?;
     let target_offset = super::element::session_viewport_offset(
         &mgr.client,
         &session_id,
-        &target_session_id,
+        &target_point.session_id,
         &state.iframe_sessions,
     )
     .await?;
-    move_mouse_interpolated(
-        &mgr.client,
-        &source_session_id,
-        &mut state.mouse_state,
-        sx,
-        sy,
-        0,
-        if human { None } else { Some(1) },
-        human,
-        seed,
-        0,
-        source_offset,
-        &state.recording_state.shared_cursor,
-    )
-    .await?;
+    let mut press_hold_ms = 0;
+    let mut release_settle_ms = 0;
+    if let Some(input) = human.as_mut() {
+        move_mouse_human(
+            &mgr.client,
+            &mut state.mouse_state,
+            HumanMove {
+                session_id: &source_point.session_id,
+                to: (sx, sy),
+                target_size: source_point.target_size,
+                buttons: 0,
+                viewport_offset: source_offset,
+            },
+            input,
+            &state.recording_state.shared_cursor,
+        )
+        .await?;
+        let pre_press = human::plan_pre_press_ms(input.profile, &mut input.rng);
+        tokio::time::sleep(tokio::time::Duration::from_millis(pre_press)).await;
+        press_hold_ms = human::plan_hold_ms(input.profile, &mut input.rng);
+        release_settle_ms = human::plan_pre_press_ms(input.profile, &mut input.rng);
+    } else {
+        move_mouse_interpolated(
+            &mgr.client,
+            &source_point.session_id,
+            &mut state.mouse_state,
+            sx,
+            sy,
+            0,
+            Some(1),
+            false,
+            0,
+            0,
+            source_offset,
+            &state.recording_state.shared_cursor,
+        )
+        .await?;
+    }
     mgr.client
         .send_command(
             "Input.dispatchMouseEvent",
             Some(json!({ "type": "mousePressed", "x": sx, "y": sy, "button": "left", "buttons": 1, "clickCount": 1 })),
-            Some(&source_session_id),
+            Some(&source_point.session_id),
         )
         .await?;
     if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
@@ -11221,28 +11782,47 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     state.mouse_state.x = sx + source_offset.0;
     state.mouse_state.y = sy + source_offset.1;
     state.mouse_state.buttons = 1;
-    move_mouse_interpolated(
-        &mgr.client,
-        &target_session_id,
-        &mut state.mouse_state,
-        tx,
-        ty,
-        if human { 250 } else { 100 },
-        if human { None } else { Some(10) },
-        human,
-        seed.wrapping_add(1),
-        1,
-        target_offset,
-        &state.recording_state.shared_cursor,
-    )
-    .await?;
+    if let Some(input) = human.as_mut() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(press_hold_ms)).await;
+        move_mouse_human(
+            &mgr.client,
+            &mut state.mouse_state,
+            HumanMove {
+                session_id: &target_point.session_id,
+                to: (tx, ty),
+                target_size: target_point.target_size,
+                buttons: 1,
+                viewport_offset: target_offset,
+            },
+            input,
+            &state.recording_state.shared_cursor,
+        )
+        .await?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(release_settle_ms)).await;
+    } else {
+        move_mouse_interpolated(
+            &mgr.client,
+            &target_point.session_id,
+            &mut state.mouse_state,
+            tx,
+            ty,
+            100,
+            Some(10),
+            false,
+            0,
+            1,
+            target_offset,
+            &state.recording_state.shared_cursor,
+        )
+        .await?;
+    }
 
     // Mouse up at target
     mgr.client
         .send_command(
             "Input.dispatchMouseEvent",
             Some(json!({ "type": "mouseReleased", "x": tx, "y": ty, "button": "left", "buttons": 0, "clickCount": 1 })),
-            Some(&target_session_id),
+            Some(&target_point.session_id),
         )
         .await?;
     state.mouse_state.buttons = 0;
@@ -11250,7 +11830,15 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         cursor.record(tx + target_offset.0, ty + target_offset.1, 0);
     }
 
-    Ok(json!({ "dragged": true, "source": source, "target": target }))
+    let receipt = watch
+        .finish(
+            &mgr.client,
+            Expectation::Drop,
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
+    Ok(json!({ "dragged": true, "source": source, "target": target, "receipt": receipt }))
 }
 
 async fn handle_expose(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
@@ -13854,6 +14442,7 @@ async fn move_mouse_interpolated(
         duration_ms
     };
     let steps = interpolated_mouse_steps(distance, duration_ms, requested_steps, human);
+    let mut moves = interaction::MouseMoves::new();
     let bend = if human && distance > 0.0 {
         let mixed = seed
             .wrapping_mul(6364136223846793005)
@@ -13893,9 +14482,7 @@ async fn move_mouse_interpolated(
             None,
             None,
         );
-        client
-            .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(session_id))
-            .await?;
+        moves.dispatch(client, session_id, &params).await?;
         mouse_state.x = x + viewport_offset.0;
         mouse_state.y = y + viewport_offset.1;
         if let Ok(mut cursor) = recording_cursor.lock() {
@@ -13903,6 +14490,64 @@ async fn move_mouse_interpolated(
         }
         if let Some((started, duration)) = schedule {
             tokio::time::sleep_until(started + duration.mul_f64(i as f64 / steps as f64)).await;
+        }
+    }
+    Ok(())
+}
+
+/// One planned human movement: where to, and how the pointer is held.
+struct HumanMove<'a> {
+    session_id: &'a str,
+    to: (f64, f64),
+    target_size: f64,
+    buttons: i32,
+    viewport_offset: (f64, f64),
+}
+
+/// Move the pointer along a planned human path and leave it on the target.
+/// Steps are scheduled against one clock so Chrome's response time is part
+/// of the planned spacing rather than added to it.
+async fn move_mouse_human(
+    client: &CdpClient,
+    mouse_state: &mut MouseState,
+    movement: HumanMove<'_>,
+    input: &mut HumanInput,
+    recording_cursor: &recording::SharedRecordingCursor,
+) -> Result<(), String> {
+    let (offset_x, offset_y) = movement.viewport_offset;
+    let from = (mouse_state.x - offset_x, mouse_state.y - offset_y);
+    let path = human::plan_mouse_path(
+        from,
+        movement.to,
+        movement.target_size,
+        input.profile,
+        &mut input.rng,
+    );
+    let _timer = human::PreciseTimerGuard::new();
+    let mut moves = interaction::MouseMoves::new();
+    let started = tokio::time::Instant::now();
+    for point in path {
+        tokio::time::sleep_until(
+            started + tokio::time::Duration::from_secs_f64(point.t_ms / 1000.0),
+        )
+        .await;
+        let params = build_mouse_event_params(
+            mouse_state,
+            "mouseMoved",
+            Some(point.x),
+            Some(point.y),
+            None,
+            Some(movement.buttons),
+            None,
+            None,
+            None,
+            None,
+        );
+        moves.dispatch(client, movement.session_id, &params).await?;
+        mouse_state.x = point.x + offset_x;
+        mouse_state.y = point.y + offset_y;
+        if let Ok(mut cursor) = recording_cursor.lock() {
+            cursor.record(mouse_state.x, mouse_state.y, movement.buttons);
         }
     }
     Ok(())
@@ -13962,6 +14607,26 @@ async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         .and_then(Value::as_str)
         .unwrap_or(&state.input_mode);
     let human = mode == "human";
+    if human && duration == 0 && steps.is_none() {
+        let mut input = human_pointer_input(cmd, &state.input_mode)?
+            .ok_or("Human input mode was requested but no model is available")?;
+        let buttons = state.mouse_state.buttons;
+        move_mouse_human(
+            &mgr.client,
+            &mut state.mouse_state,
+            HumanMove {
+                session_id: &session_id,
+                to: (x, y),
+                target_size: human::DEFAULT_TARGET_SIZE,
+                buttons,
+                viewport_offset: (0.0, 0.0),
+            },
+            &mut input,
+            &state.recording_state.shared_cursor,
+        )
+        .await?;
+        return Ok(json!({ "moved": true, "x": x, "y": y }));
+    }
     if mode == "instant" && duration == 0 && steps.is_none() {
         steps = Some(1);
     }
@@ -19470,5 +20135,300 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
             assert!(!auto_handled, "{dialog_type} should NOT be auto-handled");
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_connect_tab_tests {
+    use super::*;
+    use crate::test_utils::EnvGuard;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::Mutex;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// (target id, url, title, visible)
+    type FakeTab = (&'static str, &'static str, &'static str, bool);
+
+    struct FakeBrowser {
+        url: String,
+        calls: Arc<Mutex<Vec<Value>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeBrowser {
+        fn calls_named(&self, method: &str) -> Vec<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c["method"] == method)
+                .cloned()
+                .collect()
+        }
+    }
+
+    async fn fake_browser(tabs: Vec<FakeTab>) -> FakeBrowser {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let log = calls.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                log.lock().unwrap().push(request.clone());
+                let session = request["sessionId"].as_str().unwrap_or("").to_string();
+                let result = match request["method"].as_str().unwrap_or("") {
+                    "Target.getTargets" => {
+                        json!({ "targetInfos": tabs.iter().map(|(id, url, title, _)| json!({
+                        "targetId": id, "type": "page", "url": url, "title": title
+                    })).collect::<Vec<_>>() })
+                    }
+                    "Target.attachToTarget" => {
+                        json!({ "sessionId": format!("S-{}", request["params"]["targetId"].as_str().unwrap()) })
+                    }
+                    "Target.createTarget" => json!({ "targetId": "FRESH" }),
+                    "Runtime.evaluate" => {
+                        if request["params"]["expression"]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("visibilityState")
+                        {
+                            let visible = tabs.iter().any(|(id, _, _, visible)| {
+                                *visible && format!("S-{id}") == session
+                            });
+                            json!({ "result": { "type": "object", "value": [visible, visible] } })
+                        } else {
+                            json!({ "result": { "type": "number", "value": 1 } })
+                        }
+                    }
+                    _ => json!({}),
+                };
+                let reply = json!({ "id": request["id"], "result": result }).to_string();
+                if ws.send(Message::Text(reply)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        FakeBrowser { url, calls, server }
+    }
+
+    fn isolated_state() -> (EnvGuard<'static>, tempfile::TempDir) {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+            "AGENT_BROWSER_PIN_TAB",
+            "AGENT_BROWSER_ADOPT_TAB",
+            "AGENT_BROWSER_SESSION",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("XDG_RUNTIME_DIR");
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.remove("AGENT_BROWSER_PIN_TAB");
+        guard.remove("AGENT_BROWSER_ADOPT_TAB");
+        guard.set("AGENT_BROWSER_SESSION", "claim-test");
+        (guard, dir)
+    }
+
+    /// The tab the person is looking at must never become the session's tab.
+    #[tokio::test]
+    async fn default_auto_connect_opens_its_own_tab_and_pins_it() {
+        let (_guard, _dir) = isolated_state();
+        let browser = fake_browser(vec![("PERSON", "https://person.test/", "Inbox", true)]).await;
+        let mut state = DaemonState::new();
+        state.pin_tab = true;
+        state.browser = Some(BrowserManager::connect_cdp(&browser.url).await.unwrap());
+
+        bind_auto_connected_tab(&mut state).await.unwrap();
+
+        let mgr = state.browser.as_ref().unwrap();
+        assert_eq!(mgr.active_target_id().unwrap(), "FRESH");
+        assert_eq!(browser.calls_named("Target.createTarget").len(), 1);
+        assert!(browser.calls_named("Page.navigate").is_empty());
+        let binding = tab_binding::load(&state.session_id).unwrap().unwrap();
+        assert_eq!(binding.target_id, "FRESH");
+        assert!(binding.pinned, "the session must be pinned to its own tab");
+        browser.server.abort();
+    }
+
+    #[tokio::test]
+    async fn adopt_tab_works_in_the_visible_tab_without_pinning() {
+        let (_guard, _dir) = isolated_state();
+        let browser = fake_browser(vec![
+            ("BACKGROUND", "https://background.test/", "Other", false),
+            ("VISIBLE", "https://visible.test/", "Mine", true),
+        ])
+        .await;
+        let mut state = DaemonState::new();
+        state.adopt_tab = true;
+        state.pin_tab = false;
+        state.browser = Some(BrowserManager::connect_cdp(&browser.url).await.unwrap());
+
+        bind_auto_connected_tab(&mut state).await.unwrap();
+
+        let mgr = state.browser.as_ref().unwrap();
+        assert_eq!(mgr.active_target_id().unwrap(), "VISIBLE");
+        assert!(browser.calls_named("Target.createTarget").is_empty());
+        let binding = tab_binding::load(&state.session_id).unwrap().unwrap();
+        assert_eq!(binding.target_id, "VISIBLE");
+        assert!(!binding.pinned);
+        browser.server.abort();
+    }
+
+    #[tokio::test]
+    async fn claim_binds_and_pins_the_single_matching_tab_without_focusing_it() {
+        let (_guard, _dir) = isolated_state();
+        let browser = fake_browser(vec![
+            ("ORDERS", "https://shop.test/orders", "Orders", false),
+            ("HOME", "https://shop.test/", "Home", true),
+        ])
+        .await;
+        let mut state = DaemonState::new();
+        state.browser = Some(BrowserManager::connect_cdp(&browser.url).await.unwrap());
+
+        let result = handle_tab_claim(
+            &json!({ "action": "tab_claim", "url": "shop.test/orders" }),
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["targetId"], "ORDERS");
+        assert_eq!(result["claimed"], true);
+        assert!(state.pin_tab, "claiming must pin");
+        let binding = tab_binding::load(&state.session_id).unwrap().unwrap();
+        assert_eq!(binding.target_id, "ORDERS");
+        assert!(binding.pinned);
+        assert!(
+            browser.calls_named("Page.bringToFront").is_empty(),
+            "claiming must not steal focus"
+        );
+        browser.server.abort();
+    }
+
+    #[tokio::test]
+    async fn claim_fails_closed_on_ambiguous_and_missing_matches() {
+        let (_guard, _dir) = isolated_state();
+        let browser = fake_browser(vec![
+            ("A", "https://shop.test/a", "One", true),
+            ("B", "https://shop.test/b", "Two", false),
+        ])
+        .await;
+        let mut state = DaemonState::new();
+        state.browser = Some(BrowserManager::connect_cdp(&browser.url).await.unwrap());
+
+        let error = handle_tab_claim(
+            &json!({ "action": "tab_claim", "url": "shop.test" }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("2 open tabs match"), "{error}");
+        assert!(!state.pin_tab, "a failed claim must not pin anything");
+        assert!(tab_binding::load(&state.session_id).unwrap().is_none());
+
+        let error = handle_tab_claim(
+            &json!({ "action": "tab_claim", "url": "nowhere.test" }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("No open tab matches"), "{error}");
+        browser.server.abort();
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_a_tab_pinned_by_another_live_session() {
+        let (_guard, _dir) = isolated_state();
+        let browser = fake_browser(vec![("OWNED", "https://shop.test/o", "O", true)]).await;
+        tab_binding::save(
+            "other",
+            &tab_binding::TabBinding {
+                target_id: "OWNED".to_string(),
+                url: String::new(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            crate::connection::get_socket_dir().join("other.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let mut state = DaemonState::new();
+        state.browser = Some(BrowserManager::connect_cdp(&browser.url).await.unwrap());
+
+        let error = handle_tab_claim(
+            &json!({ "action": "tab_claim", "url": "shop.test/o" }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("tab_locked"), "{error}");
+        browser.server.abort();
+    }
+
+    #[tokio::test]
+    async fn claim_after_a_skipped_fresh_tab_does_not_open_one() {
+        let (_guard, _dir) = isolated_state();
+        let browser = fake_browser(vec![("TAB", "https://shop.test/x", "X", true)]).await;
+        let mut state = DaemonState::new();
+        state.pin_tab = true;
+        state.skip_fresh_tab = true;
+        state.browser = Some(BrowserManager::connect_cdp(&browser.url).await.unwrap());
+
+        bind_auto_connected_tab(&mut state).await.unwrap();
+        assert!(state.needs_fresh_tab);
+        assert!(browser.calls_named("Target.createTarget").is_empty());
+
+        handle_tab_claim(
+            &json!({ "action": "tab_claim", "url": "shop.test/x" }),
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(!state.needs_fresh_tab);
+        assert!(browser.calls_named("Target.createTarget").is_empty());
+        browser.server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_claim_leaves_the_session_on_its_own_fresh_tab() {
+        let (_guard, _dir) = isolated_state();
+        let browser = fake_browser(vec![("TAB", "https://shop.test/x", "X", true)]).await;
+        let mut state = DaemonState::new();
+        state.pin_tab = true;
+        state.skip_fresh_tab = true;
+        state.browser = Some(BrowserManager::connect_cdp(&browser.url).await.unwrap());
+        bind_auto_connected_tab(&mut state).await.unwrap();
+
+        let result = handle_tab_claim(
+            &json!({ "action": "tab_claim", "url": "nowhere.test" }),
+            &mut state,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            browser.calls_named("Target.createTarget").is_empty(),
+            "a failed claim must not pop up a blank tab"
+        );
+        assert!(state.needs_fresh_tab);
+
+        let response = execute_command(&json!({ "id": "next", "action": "url" }), &mut state).await;
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(
+            browser.calls_named("Target.createTarget").len(),
+            1,
+            "the next page command must not act on the person's tab"
+        );
+        assert_eq!(
+            state.browser.as_ref().unwrap().active_target_id().unwrap(),
+            "FRESH"
+        );
+        browser.server.abort();
     }
 }

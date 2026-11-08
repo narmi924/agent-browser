@@ -171,7 +171,9 @@ agent-browser mouse up left           # Release button
 agent-browser mouse wheel 100         # Scroll wheel
 ```
 
-Use `--human` with `click` or `drag` when pointer-path events matter. Movement starts at the current cursor position and ends at the target; `mouse move --seed` makes the path reproducible. `--duration` is the target total duration, including browser response time; a slow browser can still extend it.
+Use `--human [natural|careful]` and `--seed <n>` with `click`, `drag`, `hover`, `mouse move`, `type`, or `keyboard type` when pointer-path or per-key events matter. `natural` is the default. Pointer movement is curved, uses a minimum-jerk speed profile, whole-pixel steps 7 to 13 ms apart, and a Fitts' law duration, with an occasional overshoot or undershoot and short correction, a pause before pressing, and a varied press duration. The landing point stays inside the visible target. Typing uses uneven key intervals (about 125 ms natural, 210 ms careful), pauses between words, occasional thinking pauses, and occasional typos corrected with Backspace; a wrong Chinese character is a same-sound one fixed immediately. Password, card, and one-time-code fields never get typos. `type --keys` sends real key events without the pacing. Plain `type` is unchanged. In a background tab, `hover` events stay queued until the next click or until the tab renders; the response notes this.
+
+ Movement starts at the current cursor position and ends at the target; `mouse move --seed` makes the path reproducible. `--duration` is the target total duration, including browser response time; a slow browser can still extend it.
 
 ## Semantic Locators (alternative to refs)
 
@@ -181,6 +183,7 @@ agent-browser find role heading text --name "Skills"     # implicit roles work: 
 agent-browser find text "Sign In" click
 agent-browser find text "Sign In" click --exact      # Exact match only
 agent-browser find label "Email" fill "user@test.com"
+agent-browser find near "邮箱" fill "user@test.com"   # plain text beside the field, no real label
 agent-browser find placeholder "Search" fill "query"
 agent-browser find alt "Logo" click
 agent-browser find title "Close" click
@@ -245,6 +248,7 @@ agent-browser network har stop [output.har]    # Stop and save HAR
 agent-browser tab                              # List tabs with tabId and label
 agent-browser tab new [url]                    # New tab
 agent-browser tab new --label docs [url]       # New tab with a memorable label
+agent-browser tab claim --url <url> [--title <text>]  # Bind the session to one already-open tab and pin it
 agent-browser tab t2                           # Switch to tab by id
 agent-browser tab docs                         # Switch to tab by label
 agent-browser tab close                        # Close current tab
@@ -270,6 +274,8 @@ agent-browser tab close docs             # close by label
 Labels are never auto-generated, never rewritten on navigation, and must be unique within a session. To interact with another tab, switch to it first: the daemon maintains a single active tab, so refs (`@eN`) belong to the tab that was active when the snapshot ran.
 
 Tabs opened through `tab new` or `click --new-tab` inherit the session's setup before their first document loads: user agent, `set headers`, `set credentials`, origin-scoped `--headers`, init scripts, `route` rules, and emulation overrides (color scheme, timezone, locale, geolocation, offline). Turning offline mode off or setting headers to `{}` restores the default setup for future tabs.
+
+`tab claim` binds the session to a tab that is already open without moving or focusing it, and pins the session. The URL is matched exactly first, then as a case-insensitive substring; `--title` narrows it. Zero matches or more than one fail closed, and a tab pinned by another live session is refused.
 
 `tab list --json` also reports each tab's CDP `targetId`, accepted anywhere a tab ref is accepted (`tab <targetId>`, `tab close <targetId>`). Target ids stay stable across daemon restarts, unlike `t<N>` ids, which are per-daemon counters. With `--pin-tab` the session is pinned to its bound tab: if that tab is closed, commands fail with a `tab_gone` error instead of falling back to another tab, and `tab new` or `tab list` recover. JSON errors include `code: "tab_gone"` and a recovery object with `data.targetId` plus optional sanitized `data.lastUrl`; batch uses `result` for the same object.
 
@@ -463,6 +469,8 @@ agent-browser --headed ...            # Show browser window (not headless; on di
 agent-browser --webgpu ...            # Enable WebGPU (SwiftShader software Vulkan on Linux, no GPU needed)
 agent-browser --no-webmcp ...         # Disable default experimental WebMCP Chrome features (or AGENT_BROWSER_NO_WEBMCP env)
 agent-browser --cdp <port|url> ...    # Connect via CDP; root query slash is optional
+agent-browser --auto-connect ...      # Connect to a running Chrome; works in its own pinned tab, never the tab in view
+agent-browser --adopt-tab ...         # With --auto-connect: work in the tab in view instead of a new one
 agent-browser --pin-tab ...           # Pin the session to its bound tab (strict tab binding)
 agent-browser --no-pin-tab ...        # Disable a sticky pin previously enabled with --pin-tab
 agent-browser -p <provider> ...       # Browser provider or configured provider plugin

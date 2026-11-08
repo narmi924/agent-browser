@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 
-use super::cdp::chrome::{auto_connect_cdp, launch_chrome, ChromeProcess, LaunchOptions};
+use super::cdp::chrome::{
+    auto_connect_cdp, launch_chrome, AutoConnection, ChromeProcess, LaunchOptions,
+};
 use super::cdp::client::CdpClient;
 use super::cdp::discovery::discover_cdp_url;
 use super::cdp::lightpanda::{launch_lightpanda, LightpandaLaunchOptions, LightpandaProcess};
@@ -176,6 +178,93 @@ fn is_internal_chrome_target(url: &str) -> bool {
     url.starts_with("chrome://")
         || url.starts_with("chrome-extension://")
         || url.starts_with("devtools://")
+}
+
+/// Whether two URLs name the same page, ignoring a trailing slash and any
+/// fragment. Falls back to a string comparison when either does not parse.
+fn urls_match(page_url: &str, wanted: &str) -> bool {
+    match (url::Url::parse(page_url), url::Url::parse(wanted)) {
+        (Ok(mut a), Ok(mut b)) => {
+            a.set_fragment(None);
+            b.set_fragment(None);
+            let trim = |u: &url::Url| u.as_str().trim_end_matches('/').to_string();
+            trim(&a) == trim(&b)
+        }
+        _ => page_url == wanted,
+    }
+}
+
+/// One-line description of a tab for claim errors.
+fn describe_tab_for_claim(page: &PageInfo) -> String {
+    let mut shown = tab_binding::sanitize_url(&page.url);
+    if shown.is_empty() && page.url.starts_with("file:") {
+        // A local path carries no secrets worth hiding from the person.
+        shown = page.url.split(['?', '#']).next().unwrap_or("").to_string();
+    }
+    let shown = if shown.is_empty() { "(no URL)" } else { &shown };
+    format!(
+        "{} {} \"{}\"",
+        format_tab_id(page.tab_id),
+        shown,
+        page.title
+    )
+}
+
+/// Pick the single tab `tab claim` should bind. A tab whose URL equals `url`
+/// beats partial matches; otherwise `url` matches anywhere in the tab's URL.
+/// `title` narrows either way. Anything but exactly one match is an error.
+fn pick_claim_target<'a>(
+    pages: &'a [PageInfo],
+    url: &str,
+    title: Option<&str>,
+) -> Result<&'a PageInfo, String> {
+    let title_lower = title.map(str::to_lowercase);
+    let title_ok = |page: &PageInfo| {
+        title_lower
+            .as_ref()
+            .is_none_or(|t| page.title.to_lowercase().contains(t))
+    };
+    let url_lower = url.to_lowercase();
+    let exact: Vec<&PageInfo> = pages
+        .iter()
+        .filter(|page| urls_match(&page.url, url) && title_ok(page))
+        .collect();
+    let matched = if exact.is_empty() {
+        pages
+            .iter()
+            .filter(|page| page.url.to_lowercase().contains(&url_lower) && title_ok(page))
+            .collect()
+    } else {
+        exact
+    };
+    let criteria = match title {
+        Some(title) => format!("URL '{}' and title '{}'", url, title),
+        None => format!("URL '{}'", url),
+    };
+    match matched.as_slice() {
+        [only] => Ok(only),
+        [] => {
+            let open: Vec<String> = pages.iter().map(describe_tab_for_claim).collect();
+            let list = if open.is_empty() {
+                "none".to_string()
+            } else {
+                open.join("; ")
+            };
+            Err(format!(
+                "No open tab matches {}. Open tabs: {}. Nothing was claimed.",
+                criteria, list
+            ))
+        }
+        several => {
+            let list: Vec<String> = several.iter().map(|p| describe_tab_for_claim(p)).collect();
+            Err(format!(
+                "{} open tabs match {}: {}. Nothing was claimed; add --title or use a longer URL.",
+                several.len(),
+                criteria,
+                list.join("; ")
+            ))
+        }
+    }
 }
 
 pub(crate) fn should_track_target(target: &TargetInfo) -> bool {
@@ -766,6 +855,20 @@ impl BrowserManager {
     ) -> Result<Self, String> {
         let ws_url = resolve_cdp_url(url).await?;
         let client = Arc::new(CdpClient::connect_with_headers(&ws_url, headers).await?);
+        Self::attach_to_client(client, ws_url, direct_page).await
+    }
+
+    /// Attach over a connection auto-connect already opened, so Chrome sees
+    /// (and prompts for) a single WebSocket.
+    pub(crate) async fn attach_auto_connection(connection: AutoConnection) -> Result<Self, String> {
+        Self::attach_to_client(Arc::new(connection.client), connection.ws_url, false).await
+    }
+
+    async fn attach_to_client(
+        client: Arc<CdpClient>,
+        ws_url: String,
+        direct_page: bool,
+    ) -> Result<Self, String> {
         let mut manager = Self {
             client,
             browser_process: None,
@@ -811,8 +914,7 @@ impl BrowserManager {
     }
 
     pub async fn connect_auto() -> Result<Self, String> {
-        let ws_url = auto_connect_cdp().await?;
-        Self::connect_cdp(&ws_url).await
+        Self::attach_auto_connection(auto_connect_cdp().await?).await
     }
 
     async fn discover_and_attach_targets(&mut self) -> Result<(), String> {
@@ -1908,6 +2010,15 @@ impl BrowserManager {
         index: usize,
         dialog_session: Option<&str>,
     ) -> Result<Value, String> {
+        self.switch_to_index(index, dialog_session, true).await
+    }
+
+    async fn switch_to_index(
+        &mut self,
+        index: usize,
+        dialog_session: Option<&str>,
+        bring_to_front: bool,
+    ) -> Result<Value, String> {
         if index >= self.pages.len() {
             return Err(format!(
                 "Tab index {} out of range (0-{})",
@@ -1935,11 +2046,12 @@ impl BrowserManager {
         // An explicit switch re-binds the session and clears any tab_gone.
         self.bind_active_target();
 
-        // Bring tab to front
-        let _ = self
-            .client
-            .send_command("Page.bringToFront", None, Some(&session_id))
-            .await;
+        if bring_to_front {
+            let _ = self
+                .client
+                .send_command("Page.bringToFront", None, Some(&session_id))
+                .await;
+        }
 
         // A dialog-blocked tab cannot answer script evaluation until the dialog
         // is resolved, so fall back to the last known url/title instead of
@@ -2298,6 +2410,146 @@ impl BrowserManager {
                 Some(session_id),
             )
             .await?;
+        Ok(())
+    }
+
+    /// Refresh the tracked tab list from the browser: updated URLs and titles,
+    /// plus tabs the person opened since the last event drain.
+    async fn refresh_tab_list(&mut self) -> Result<(), String> {
+        let result: GetTargetsResult = self
+            .client
+            .send_command_typed("Target.getTargets", &json!({}), None)
+            .await?;
+        for target in result
+            .target_infos
+            .iter()
+            .filter(|t| should_track_target(t))
+        {
+            if self.update_page_target_info(target) {
+                continue;
+            }
+            let attached: AttachToTargetResult = self
+                .client
+                .send_command_typed(
+                    "Target.attachToTarget",
+                    &AttachToTargetParams {
+                        target_id: target.target_id.clone(),
+                        flatten: true,
+                    },
+                    None,
+                )
+                .await?;
+            self.register_discovered_page(
+                &target.target_id,
+                &attached.session_id,
+                target.url.clone(),
+                target.title.clone(),
+                target.target_type.clone(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Bind this session to the one open tab matching `url` (and `title`).
+    /// Refuses when zero or several tabs match, or when another live session
+    /// has pinned the tab. Does not bring the tab to the front.
+    pub async fn claim_open_tab(
+        &mut self,
+        url: &str,
+        title: Option<&str>,
+        session_name: &str,
+        dialog_session: Option<&str>,
+    ) -> Result<Value, String> {
+        self.refresh_tab_list().await?;
+        let tab_id = pick_claim_target(&self.pages, url, title)?.tab_id;
+        let target_id = self
+            .target_id_for_tab(tab_id)
+            .ok_or_else(|| format!("Tab {} disappeared", format_tab_id(tab_id)))?
+            .to_string();
+        if let Some(owner) = tab_binding::pinned_owner(&target_id, session_name) {
+            return Err(format!(
+                "tab_locked: tab {} is pinned by session '{}'; close that session or claim another tab",
+                target_id, owner
+            ));
+        }
+        let index = self
+            .pages
+            .iter()
+            .position(|p| p.tab_id == tab_id)
+            .ok_or_else(|| format!("Tab {} disappeared", format_tab_id(tab_id)))?;
+        let mut result = self.switch_to_index(index, dialog_session, false).await?;
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("claimed".to_string(), Value::Bool(true));
+        }
+        Ok(result)
+    }
+
+    /// Close a tab this session opened and never used. A tab that has since
+    /// navigated anywhere is left alone.
+    pub async fn close_tab_if_blank(&mut self, target_id: &str) {
+        let blank = self
+            .pages
+            .iter()
+            .find(|p| p.target_id == target_id)
+            .is_some_and(|p| p.url.is_empty() || p.url == "about:blank");
+        if !blank {
+            return;
+        }
+        let _ = self
+            .client
+            .send_command(
+                "Target.closeTarget",
+                Some(json!({ "targetId": target_id })),
+                None,
+            )
+            .await;
+        self.remove_page_by_target_id(target_id);
+    }
+
+    /// Make the tab the person is looking at the active one: the visible tab
+    /// with focus, else the first visible tab, else the current selection.
+    pub async fn adopt_visible_tab(&mut self) -> Result<(), String> {
+        let probes = self.pages.iter().enumerate().map(|(index, page)| {
+            let session_id = page.session_id.clone();
+            let client = self.client.clone();
+            async move {
+                let response = tokio::time::timeout(
+                    Duration::from_millis(RENDERER_PROBE_TIMEOUT_MS),
+                    client.send_command(
+                        "Runtime.evaluate",
+                        Some(json!({
+                            "expression": "[document.visibilityState === 'visible', document.hasFocus()]",
+                            "returnByValue": true,
+                        })),
+                        Some(&session_id),
+                    ),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                let state = response.pointer("/result/value")?;
+                let visible = state.get(0)?.as_bool()?;
+                let focused = state.get(1)?.as_bool()?;
+                visible.then_some((index, focused))
+            }
+        });
+        let visible: Vec<(usize, bool)> = futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        let chosen = visible
+            .iter()
+            .find(|(_, focused)| *focused)
+            .or_else(|| visible.first())
+            .map(|(index, _)| *index)
+            .unwrap_or(self.active_page_index);
+        if chosen < self.pages.len() {
+            self.active_page_index = chosen;
+            self.bind_active_target();
+            let session_id = self.pages[chosen].session_id.clone();
+            self.enable_domains(&session_id).await?;
+        }
         Ok(())
     }
 
@@ -2873,6 +3125,113 @@ async fn resolve_cdp_url(input: &str) -> Result<String, String> {
         "Invalid CDP target: {}. Use ws://, http://, or a port number.",
         input
     ))
+}
+
+#[cfg(test)]
+mod tab_claim_tests {
+    use super::*;
+
+    fn page(tab_id: u32, url: &str, title: &str) -> PageInfo {
+        PageInfo {
+            tab_id,
+            label: None,
+            target_id: format!("T{tab_id}"),
+            session_id: format!("S{tab_id}"),
+            url: url.to_string(),
+            title: title.to_string(),
+            target_type: "page".to_string(),
+        }
+    }
+
+    #[test]
+    fn claim_picks_the_single_exact_url_over_partial_matches() {
+        let pages = vec![
+            page(1, "https://a.test/", "Home"),
+            page(2, "https://a.test/orders", "Orders"),
+        ];
+        let picked = pick_claim_target(&pages, "https://a.test/", None).unwrap();
+        assert_eq!(picked.tab_id, 1);
+    }
+
+    #[test]
+    fn claim_matches_a_substring_of_the_url() {
+        let pages = vec![
+            page(1, "https://mail.test/inbox?sid=abc", "Mail"),
+            page(2, "https://b.test/", "B"),
+        ];
+        assert_eq!(
+            pick_claim_target(&pages, "mail.test", None).unwrap().tab_id,
+            1
+        );
+    }
+
+    #[test]
+    fn claim_narrows_by_title() {
+        let pages = vec![
+            page(1, "https://a.test/x", "Orders"),
+            page(2, "https://a.test/y", "Settings"),
+        ];
+        assert_eq!(
+            pick_claim_target(&pages, "a.test", Some("settings"))
+                .unwrap()
+                .tab_id,
+            2
+        );
+    }
+
+    #[test]
+    fn claim_fails_closed_when_several_tabs_match() {
+        let pages = vec![
+            page(1, "https://a.test/x?token=secret", "One"),
+            page(2, "https://a.test/y", "Two"),
+        ];
+        let error = pick_claim_target(&pages, "a.test", None).unwrap_err();
+        assert!(error.contains("2 open tabs match"), "{error}");
+        assert!(error.contains("Nothing was claimed"), "{error}");
+        assert!(
+            !error.contains("token=secret"),
+            "must not leak URL secrets: {error}"
+        );
+    }
+
+    #[test]
+    fn claim_fails_closed_when_nothing_matches() {
+        let pages = vec![page(1, "https://a.test/", "One")];
+        let error = pick_claim_target(&pages, "b.test", None).unwrap_err();
+        assert!(error.contains("No open tab matches"), "{error}");
+        assert!(error.contains("t1"), "should list open tabs: {error}");
+        let error = pick_claim_target(&[], "b.test", None).unwrap_err();
+        assert!(error.contains("none"), "{error}");
+    }
+
+    #[test]
+    fn claim_treats_a_trailing_slash_and_fragment_as_the_same_page() {
+        let pages = vec![
+            page(1, "https://a.test/path/#top", "One"),
+            page(2, "https://a.test/path/more", "Two"),
+        ];
+        assert_eq!(
+            pick_claim_target(&pages, "https://a.test/path", None)
+                .unwrap()
+                .tab_id,
+            1
+        );
+    }
+
+    #[test]
+    fn claim_exact_matches_are_still_required_to_be_unique() {
+        let pages = vec![
+            page(1, "https://a.test/", "One"),
+            page(2, "https://a.test/", "Two"),
+        ];
+        assert!(pick_claim_target(&pages, "https://a.test/", None).is_err());
+        assert_eq!(
+            pick_claim_target(&pages, "https://a.test/", Some("two"))
+                .unwrap()
+                .tab_id,
+            2
+        );
+    }
 }
 
 #[cfg(test)]

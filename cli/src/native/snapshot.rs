@@ -125,6 +125,80 @@ const INTERACTIVE_ROLES: &[&str] = &[
     "Iframe",
 ];
 
+/// Roles of form controls that can be identified by the text beside them.
+const NEAR_TEXT_ROLES: &[&str] = &[
+    "textbox",
+    "searchbox",
+    "combobox",
+    "listbox",
+    "spinbutton",
+    "checkbox",
+    "radio",
+    "switch",
+    "slider",
+];
+
+/// Most unnamed controls that get a near-text lookup in one snapshot, so a
+/// page full of unlabeled inputs cannot make every snapshot expensive.
+const NEAR_TEXT_LIMIT: usize = 120;
+
+/// CSS selector for the form controls `find near` searches, as a JS string.
+pub(crate) const FORM_CONTROL_SELECTOR_JSON: &str = "\"input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]),select,textarea,[contenteditable=''],[contenteditable='true'],[role=textbox],[role=searchbox],[role=combobox],[role=listbox],[role=spinbutton],[role=checkbox],[role=radio],[role=switch],[role=slider]\"";
+
+/// JS source for `nearText(el)`: the nearest visible text before a control in
+/// reading order, or null. It walks backwards through the DOM and stops at
+/// another control, so a field never borrows a neighbouring field's caption.
+/// The text must sit on the same line to the left of the control, or directly
+/// above it. A run that is only punctuation (`：`, `*`) is joined to the text
+/// before it.
+pub(crate) const NEAR_TEXT_JS: &str = r#"(el) => {
+    const doc = el.ownerDocument;
+    if (!doc || !doc.body) return null;
+    const norm = (s) => (s || '').replace(/[\s\u00a0]+/g, ' ').trim();
+    const CONTROLS = 'input:not([type=hidden]),select,textarea,button,[contenteditable=""],[contenteditable="true"],[role=textbox],[role=searchbox],[role=combobox],[role=listbox],[role=spinbutton],[role=checkbox],[role=radio],[role=switch],[role=slider]';
+    const box = el.getBoundingClientRect();
+    if (box.width <= 0 || box.height <= 0) return null;
+    const view = doc.defaultView;
+    const range = doc.createRange();
+    const placed = (node) => {
+        const parent = node.parentElement;
+        if (!parent) return null;
+        const style = view.getComputedStyle(parent);
+        if (style.display === 'none' || style.visibility === 'hidden') return null;
+        range.selectNodeContents(node);
+        const r = range.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 ? r : null;
+    };
+    const isNearby = (r) => {
+        const sameLine = r.top < box.bottom && r.bottom > box.top;
+        if (sameLine) return r.right <= box.left + 4 && box.left - r.right <= 360;
+        return r.bottom <= box.top + 4 && box.top - r.bottom <= 72
+            && r.left <= box.right && r.right >= box.left - 40;
+    };
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    walker.currentNode = el;
+    let picked = [];
+    for (let steps = 0; steps < 2000; steps++) {
+        const node = walker.previousNode();
+        if (!node) break;
+        if (node.nodeType === 1) {
+            if (!node.contains(el) && node.matches(CONTROLS)) break;
+            continue;
+        }
+        const text = norm(node.nodeValue);
+        if (!text) continue;
+        const r = placed(node);
+        if (!r) continue;
+        if (!isNearby(r)) break;
+        picked.unshift(text);
+        if (/[^\s:：*＊]/u.test(text)) break;
+    }
+    if (!picked.length) return null;
+    const joined = norm(picked.join(' '));
+    if (!/[^\s:：*＊]/u.test(joined)) return null;
+    return joined.length > 60 ? joined.slice(0, 60) + '...' : joined;
+}"#;
+
 const CONTENT_ROLES: &[&str] = &[
     "heading",
     "cell",
@@ -179,6 +253,47 @@ fn normalize_snapshot_name(name: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
+mod near_text_render_tests {
+    use super::*;
+
+    fn textbox(name: &str, near: Option<&str>, ref_id: &str) -> TreeNode {
+        let mut node = TreeNode::empty();
+        node.role = "textbox".to_string();
+        node.name = name.to_string();
+        node.has_ref = true;
+        node.ref_id = Some(ref_id.to_string());
+        node.near = near.map(str::to_string);
+        node
+    }
+
+    fn render(node: TreeNode) -> String {
+        let mut output = String::new();
+        let options = SnapshotOptions {
+            interactive: true,
+            ..SnapshotOptions::default()
+        };
+        render_tree(&[node], 0, 0, &mut output, &options);
+        output
+    }
+
+    #[test]
+    fn unnamed_control_shows_near_text_before_the_ref() {
+        assert_eq!(
+            render(textbox("", Some("邮箱："), "e4")).trim(),
+            "- textbox [near=\"邮箱：\", ref=e4]"
+        );
+    }
+
+    #[test]
+    fn named_control_is_unchanged() {
+        assert_eq!(
+            render(textbox("Email", None, "e5")).trim(),
+            "- textbox \"Email\" [ref=e5]"
+        );
+    }
+}
+
 #[derive(Default)]
 pub struct SnapshotOptions {
     pub selector: Option<String>,
@@ -206,6 +321,7 @@ struct TreeNode {
     depth: usize,
     cursor_info: Option<CursorElementInfo>,
     url: Option<String>,
+    near: Option<String>,
 }
 
 impl TreeNode {
@@ -229,6 +345,7 @@ impl TreeNode {
             depth: 0,
             cursor_info: None,
             url: None,
+            near: None,
         }
     }
 
@@ -250,6 +367,7 @@ impl TreeNode {
         self.ref_id = None;
         self.depth = 0;
         self.cursor_info = None;
+        self.near = None;
     }
 }
 
@@ -565,6 +683,10 @@ pub async fn take_snapshot(
 
     ref_map.set_next_ref_num(next_ref);
 
+    if options.interactive {
+        attach_near_text(client, effective_session_id, &mut tree_nodes, ref_map).await;
+    }
+
     if options.urls {
         let link_nodes: Vec<(usize, i64)> = tree_nodes
             .iter()
@@ -722,6 +844,72 @@ pub async fn take_snapshot(
     }
 
     Ok(trimmed)
+}
+
+/// Give each unnamed form control the nearest visible text before it, so an
+/// unlabeled field is still identifiable in `snapshot -i`.
+async fn attach_near_text(
+    client: &CdpClient,
+    session_id: &str,
+    tree_nodes: &mut [TreeNode],
+    ref_map: &mut RefMap,
+) {
+    let targets: Vec<(usize, i64)> = tree_nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.has_ref
+                && normalize_snapshot_name(&node.name).trim().is_empty()
+                && NEAR_TEXT_ROLES.contains(&node.role.as_str())
+        })
+        .filter_map(|(idx, node)| node.backend_node_id.map(|bid| (idx, bid)))
+        .take(NEAR_TEXT_LIMIT)
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let lookups = targets.iter().map(|&(idx, backend_node_id)| async move {
+        (idx, near_text_of(client, session_id, backend_node_id).await)
+    });
+    for (idx, near) in futures_util::future::join_all(lookups).await {
+        let Some(near) = near else { continue };
+        if let Some(ref_id) = tree_nodes[idx].ref_id.clone() {
+            ref_map.set_near(&ref_id, &near);
+        }
+        tree_nodes[idx].near = Some(near);
+    }
+}
+
+async fn near_text_of(
+    client: &CdpClient,
+    session_id: &str,
+    backend_node_id: i64,
+) -> Option<String> {
+    let resolved = client
+        .send_command(
+            "DOM.resolveNode",
+            Some(serde_json::json!({ "backendNodeId": backend_node_id })),
+            Some(session_id),
+        )
+        .await
+        .ok()?;
+    let object_id = resolved.pointer("/object/objectId")?.as_str()?;
+    let result = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(serde_json::json!({
+                "objectId": object_id,
+                "functionDeclaration": format!("function() {{ return ({NEAR_TEXT_JS})(this); }}"),
+                "returnByValue": true,
+            })),
+            Some(session_id),
+        )
+        .await
+        .ok()?;
+    result
+        .pointer("/result/value")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Resolve the child frame ID for an iframe element given its backendNodeId.
@@ -1122,6 +1310,7 @@ fn build_tree(nodes: &[AXNode]) -> (Vec<TreeNode>, Vec<usize>) {
             depth: 0,
             cursor_info: None,
             url: None,
+            near: None,
         });
         id_to_idx.insert(node.node_id.clone(), i);
     }
@@ -1313,6 +1502,12 @@ fn render_tree(
     if let Some(required) = node.required {
         if required {
             attrs.push("required".to_string());
+        }
+    }
+
+    if let Some(ref near) = node.near {
+        if let Ok(quoted) = serde_json::to_string(near) {
+            attrs.push(format!("near={}", quoted));
         }
     }
 

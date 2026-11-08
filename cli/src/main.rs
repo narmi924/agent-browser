@@ -129,6 +129,12 @@ fn attach_pin_tab_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
     }
 }
 
+fn attach_adopt_tab_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
+    if flags.auto_connect && flags.adopt_tab {
+        cmd["adoptTab"] = json!(true);
+    }
+}
+
 fn attach_input_mode(cmd: &mut serde_json::Value, flags: &Flags) {
     if flags.cli_input_mode {
         cmd["defaultInputMode"] = json!(flags.input_mode);
@@ -208,6 +214,10 @@ fn is_valid_restore_save_policy(policy: &str) -> bool {
 }
 
 fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
+    if let Some(conflict) = flags.auto_connect_tab_conflict() {
+        return Some(conflict);
+    }
+
     if flags.cdp.is_some() && flags.provider.is_some() {
         return Some("Cannot use --cdp and -p/--provider together");
     }
@@ -1686,6 +1696,7 @@ fn main() {
     attach_plugins_to_command(&mut cmd, &flags.plugins);
 
     attach_pin_tab_to_command(&mut cmd, &flags);
+    attach_adopt_tab_to_command(&mut cmd, &flags);
     attach_restore_config_to_command(&mut cmd, &flags);
 
     // Validate restore/session persistence name before starting daemon
@@ -1763,6 +1774,7 @@ fn main() {
         }
         exit(1);
     }
+    flags.apply_auto_connect_tab_policy();
 
     if let Some(ref ca_path) = flags.ca_cert {
         if let Err(msg) = ca_bundle::load(ca_path) {
@@ -1856,6 +1868,11 @@ fn main() {
         attach_webmcp_launch_option(&mut launch_cmd, &flags);
         attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
         attach_pin_tab_to_command(&mut launch_cmd, &flags);
+        attach_adopt_tab_to_command(&mut launch_cmd, &flags);
+        if cmd.get("action").and_then(|v| v.as_str()) == Some("tab_claim") {
+            // The command binds a tab itself; a fresh one would only flash.
+            launch_cmd["skipFreshTab"] = json!(true);
+        }
         attach_restore_config_to_command(&mut launch_cmd, &flags);
 
         if flags.ignore_https_errors {
@@ -2340,6 +2357,7 @@ fn run_batch(
         attach_restore_config_to_command(&mut parsed, flags);
 
         attach_pin_tab_to_command(&mut parsed, flags);
+        attach_adopt_tab_to_command(&mut parsed, flags);
 
         match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
             Ok(resp) => {
@@ -2642,6 +2660,33 @@ mod tests {
             cmd["allowedDomains"],
             json!(["example.com", "*.example.org"])
         );
+    }
+
+    #[test]
+    fn auto_connect_sends_the_pin_and_adopt_opts_out() {
+        let args: Vec<String> = ["--auto-connect", "open", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut flags = crate::flags::parse_flags(&args);
+        flags.apply_auto_connect_tab_policy();
+        let mut cmd = json!({});
+        attach_pin_tab_to_command(&mut cmd, &flags);
+        attach_adopt_tab_to_command(&mut cmd, &flags);
+        assert_eq!(cmd["pinTab"], true);
+        assert!(cmd.get("adoptTab").is_none());
+
+        let args: Vec<String> = ["--auto-connect", "--adopt-tab", "open", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut flags = crate::flags::parse_flags(&args);
+        flags.apply_auto_connect_tab_policy();
+        let mut cmd = json!({});
+        attach_pin_tab_to_command(&mut cmd, &flags);
+        attach_adopt_tab_to_command(&mut cmd, &flags);
+        assert_eq!(cmd["pinTab"], false, "adopt must clear a sticky pin");
+        assert_eq!(cmd["adoptTab"], true);
     }
 
     #[test]

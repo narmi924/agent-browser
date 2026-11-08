@@ -12608,9 +12608,11 @@ async fn e2e_recording_cursor_uses_page_coordinates_for_oopif() {
             .unwrap()
             .at(f64::INFINITY);
         assert!(cursor.visible);
+        // Human movement lands anywhere on the button, whose page-coordinate
+        // box is centred on (310, 220): a wrong frame offset would be far off.
         assert!(
-            (cursor.x - 310.0).abs() < 1.0 && (cursor.y - 220.0).abs() < 1.0,
-            "{action}: cursor should be at page (310, 220), got {cursor:?}"
+            (cursor.x - 310.0).abs() <= 40.0 && (cursor.y - 220.0).abs() <= 20.0,
+            "{action}: cursor should be on the button around page (310, 220), got {cursor:?}"
         );
         assert!((state.mouse_state.x - cursor.x).abs() < 1.0);
         assert!((state.mouse_state.y - cursor.y).abs() < 1.0);
@@ -14342,4 +14344,546 @@ async fn e2e_state_load_keeps_storage_away_from_page_scripts_and_redirects() {
     other_server.abort();
     redirect_server.abort();
     hook_server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Action truthfulness: visible-part clicks, receipts, key events, near text
+// ---------------------------------------------------------------------------
+
+async fn launch_with_page(html: &str) -> DaemonState {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "launch", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "content", "action": "setcontent", "html": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    state
+}
+
+async fn evaluate(state: &mut DaemonState, script: &str) -> Value {
+    let resp = execute_command(
+        &json!({ "id": "eval", "action": "evaluate", "script": script }),
+        state,
+    )
+    .await;
+    assert_success(&resp);
+    get_data(&resp)["result"].clone()
+}
+
+async fn command(state: &mut DaemonState, body: Value) -> Value {
+    let mut body = body;
+    body["id"] = json!("cmd");
+    execute_command(&body, state).await
+}
+
+const COVER_PAGE: &str = r#"<!doctype html><body style="margin:20px">
+<div style="position:relative;width:300px;height:44px"><button id="half" style="position:absolute;left:0;top:0;width:300px;height:44px">Half</button><div id="cover" style="position:absolute;left:0;top:0;width:210px;height:44px;background:#f4c;z-index:3"></div></div>
+<div style="position:relative;width:300px;height:44px;margin-top:10px"><button id="full" style="position:absolute;left:0;top:0;width:300px;height:44px">Full</button><div id="cover2" style="position:absolute;left:0;top:0;width:300px;height:44px;background:#4cf;z-index:3"></div></div>
+<div id="clipbox" style="width:120px;height:44px;overflow:hidden;position:relative;margin-top:10px"><button id="clipped" style="position:absolute;left:-180px;top:0;width:300px;height:44px">Clipped</button></div>
+<div id="log"></div></body>"#;
+
+async fn install_click_log(state: &mut DaemonState) {
+    evaluate(
+        state,
+        "window.L=[];document.addEventListener('click',e=>L.push([e.target.id,e.isTrusted]),true);1",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_click_reaches_the_visible_part_of_a_covered_target() {
+    let mut state = launch_with_page(COVER_PAGE).await;
+    install_click_log(&mut state).await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "click", "selector": "#half" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["verified"], true);
+    assert_eq!(evaluate(&mut state, "L[0][0]").await, json!("half"));
+    assert_eq!(evaluate(&mut state, "L[0][1]").await, json!(true));
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_click_reaches_the_visible_part_of_a_clipped_target() {
+    let mut state = launch_with_page(COVER_PAGE).await;
+    install_click_log(&mut state).await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "click", "selector": "#clipped" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["verified"], true);
+    assert_eq!(evaluate(&mut state, "L[0][0]").await, json!("clipped"));
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_click_refuses_a_fully_covered_target_without_clicking_through() {
+    let mut state = launch_with_page(COVER_PAGE).await;
+    install_click_log(&mut state).await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "click", "selector": "#full" }),
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    let error = resp["error"].as_str().unwrap_or_default();
+    assert!(error.contains("covered by"), "{error}");
+    assert!(error.contains("cover2"), "{error}");
+    assert_eq!(evaluate(&mut state, "L.length").await, json!(0));
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_read_back_is_verified_and_a_rejecting_field_is_not() {
+    let mut state = launch_with_page(
+        r#"<input id="plain"><input id="short" maxlength="2"><input id="secret" type="password">"#,
+    )
+    .await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "fill", "selector": "#plain", "value": "hello" }),
+    )
+    .await;
+    assert_success(&resp);
+    let receipt = &get_data(&resp)["receipt"];
+    assert_eq!(receipt["verified"], true);
+    assert_eq!(receipt["checks"][0]["actual"], "hello");
+    assert_eq!(receipt["effects"]["url_changed"], false);
+
+    let resp = command(
+        &mut state,
+        json!({ "action": "fill", "selector": "#short", "value": "hello" }),
+    )
+    .await;
+    assert_success(&resp);
+    let receipt = &get_data(&resp)["receipt"];
+    assert_eq!(receipt["verified"], false);
+    assert_eq!(receipt["checks"][0]["actual"], "he");
+
+    let resp = command(
+        &mut state,
+        json!({ "action": "fill", "selector": "#secret", "value": "hunter2" }),
+    )
+    .await;
+    assert_success(&resp);
+    let receipt = &get_data(&resp)["receipt"];
+    assert_eq!(receipt["verified"], true);
+    assert!(!receipt.to_string().contains("hunter2"), "{receipt}");
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_receipts_cover_select_check_upload_and_reported_effects() {
+    let mut state = launch_with_page(
+        r##"<select id="s"><option value="1">One</option><option value="2">Two</option></select>
+<input id="c" type="checkbox"><input id="f" type="file">
+<button id="add">Add</button><button id="gone">Remove self</button><a id="hash" href="#next">Hash</a>
+<div id="area"></div>"##,
+    )
+    .await;
+    evaluate(
+        &mut state,
+        "document.getElementById('add').onclick=()=>{document.getElementById('area').textContent='added'};document.getElementById('gone').onclick=(e)=>e.target.remove();1",
+    )
+    .await;
+
+    let resp = command(
+        &mut state,
+        json!({ "action": "select", "selector": "#s", "values": "Two" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["verified"], true);
+
+    let resp = command(&mut state, json!({ "action": "check", "selector": "#c" })).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["verified"], true);
+    assert_eq!(get_data(&resp)["receipt"]["checks"][0]["actual"], true);
+
+    let upload_dir = tempfile::tempdir().unwrap();
+    let upload_path = upload_dir.path().join("report.txt");
+    std::fs::write(&upload_path, "content").unwrap();
+    let resp = command(
+        &mut state,
+        json!({ "action": "upload", "selector": "#f", "files": [upload_path.to_str().unwrap()] }),
+    )
+    .await;
+    assert_success(&resp);
+    let receipt = &get_data(&resp)["receipt"];
+    assert_eq!(receipt["verified"], true);
+    assert_eq!(receipt["checks"][0]["actual"][0], "report.txt");
+
+    let resp = command(&mut state, json!({ "action": "click", "selector": "#add" })).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["effects"]["dom_changed"], true);
+
+    let resp = command(
+        &mut state,
+        json!({ "action": "click", "selector": "#gone" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["receipt"]["effects"]["target_removed"],
+        true
+    );
+
+    let resp = command(
+        &mut state,
+        json!({ "action": "click", "selector": "#hash" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["effects"]["url_changed"], true);
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_drag_receipt_reports_drop_target_change() {
+    let mut state = launch_with_page(
+        r#"<div id="src" draggable="true" style="width:80px;height:40px;background:#fc6">drag</div>
+<div id="dst" style="width:160px;height:60px;background:#6cf;margin-top:20px">drop here</div>"#,
+    )
+    .await;
+    evaluate(
+        &mut state,
+        "const s=document.getElementById('src'),d=document.getElementById('dst');s.addEventListener('dragstart',e=>e.dataTransfer.setData('text/plain','x'));d.addEventListener('dragover',e=>e.preventDefault());d.addEventListener('drop',e=>{e.preventDefault();d.textContent='dropped'});1",
+    )
+    .await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "drag", "source": "#src", "target": "#dst" }),
+    )
+    .await;
+    assert_success(&resp);
+    let receipt = &get_data(&resp)["receipt"];
+    assert_eq!(receipt["checks"][0]["content_changed"], true, "{receipt}");
+    assert_eq!(receipt["verified"], true);
+    let _ = close_current_browser(&mut state).await;
+}
+
+const KEY_PAGE: &str =
+    r#"<input id="t"><div id="ce" contenteditable="true" style="min-height:30px"></div>"#;
+
+async fn install_key_log(state: &mut DaemonState) {
+    evaluate(
+        state,
+        "window.K=[];for(const t of ['keydown','keypress','keyup','input'])document.getElementById('t').addEventListener(t,e=>K.push([t,e.key,e.code,e.keyCode,e.isTrusted]));1",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_keyboard_type_delivers_real_key_events() {
+    let mut state = launch_with_page(KEY_PAGE).await;
+    install_key_log(&mut state).await;
+    let resp = command(&mut state, json!({ "action": "focus", "selector": "#t" })).await;
+    assert_success(&resp);
+    let resp = command(
+        &mut state,
+        json!({ "action": "keyboard", "subaction": "type", "text": "aB!" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["verified"], true);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('t').value").await,
+        json!("aB!")
+    );
+    let kinds = evaluate(&mut state, "K.filter(k=>k[0]==='keydown').map(k=>k[1])").await;
+    assert_eq!(kinds, json!(["a", "Shift", "B", "Shift", "!"]));
+    assert_eq!(
+        evaluate(&mut state, "K.filter(k=>k[0]==='keypress').length").await,
+        json!(3)
+    );
+    assert_eq!(
+        evaluate(&mut state, "K.filter(k=>k[0]==='keyup').length").await,
+        json!(5)
+    );
+    assert_eq!(
+        evaluate(&mut state, "K.find(k=>k[0]==='keydown'&&k[1]==='a')").await,
+        json!(["keydown", "a", "KeyA", 65, true])
+    );
+    assert_eq!(
+        evaluate(&mut state, "K.find(k=>k[0]==='keydown'&&k[1]==='!')").await,
+        json!(["keydown", "!", "Digit1", 49, true])
+    );
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_type_keys_flag_sends_key_events_and_inserts_cjk() {
+    let mut state = launch_with_page(KEY_PAGE).await;
+    install_key_log(&mut state).await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "type", "selector": "#t", "text": "ab中", "keys": true }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["verified"], true);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('t').value").await,
+        json!("ab中")
+    );
+    assert_eq!(
+        evaluate(&mut state, "K.filter(k=>k[0]==='keydown').length").await,
+        json!(2)
+    );
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_plain_type_keeps_inserting_text_without_key_events() {
+    let mut state = launch_with_page(KEY_PAGE).await;
+    install_key_log(&mut state).await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "type", "selector": "#t", "text": "ab" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('t').value").await,
+        json!("ab")
+    );
+    assert_eq!(
+        evaluate(&mut state, "K.filter(k=>k[0]==='keydown').length").await,
+        json!(0)
+    );
+    let _ = close_current_browser(&mut state).await;
+}
+
+const NEAR_PAGE: &str = r#"<!doctype html><body style="font:16px sans-serif;margin:24px">
+<div><label for="named">Named</label> <input id="named"></div>
+<div style="margin-top:12px"><span style="display:inline-block;width:120px">邮箱：</span><input id="email"></div>
+<div style="margin-top:12px"><span style="display:inline-block;width:120px">手机号</span><input id="phone"></div>
+<div style="margin-top:12px"><div>城市 *</div><input id="city"></div>
+<div style="margin-top:12px"><input id="orphan1"></div>
+<div style="margin-top:12px"><input id="orphan2"></div>
+<div style="margin-top:12px"><span style="display:inline-block;width:120px">备注</span><input id="note1"></div>
+<div style="margin-top:12px"><span style="display:inline-block;width:120px">备注</span><input id="note2"></div>
+</body>"#;
+
+#[tokio::test]
+#[ignore]
+async fn e2e_snapshot_interactive_shows_nearby_text_for_unnamed_controls() {
+    let mut state = launch_with_page(NEAR_PAGE).await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "snapshot", "interactive": true }),
+    )
+    .await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap().to_string();
+    assert!(
+        snapshot.contains("textbox [near=\"邮箱：\", ref="),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.contains("textbox [near=\"手机号\", ref="),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.contains("textbox [near=\"城市 *\", ref="),
+        "{snapshot}"
+    );
+    assert!(snapshot.contains("textbox \"Named\" [ref="), "{snapshot}");
+    assert_eq!(
+        snapshot.matches("near=").count(),
+        5,
+        "orphan inputs must not borrow a neighbour's text: {snapshot}"
+    );
+    let refs = &get_data(&resp)["refs"];
+    let near_refs: Vec<&str> = refs
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|entry| entry["near"].as_str())
+        .collect();
+    assert!(near_refs.contains(&"邮箱："), "{near_refs:?}");
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_find_near_acts_on_the_field_beside_the_text() {
+    let mut state = launch_with_page(NEAR_PAGE).await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "getbynear", "text": "手机号", "subaction": "fill", "value": "138" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('phone').value").await,
+        json!("138")
+    );
+    assert_eq!(
+        evaluate(
+            &mut state,
+            "document.querySelector('[data-agent-browser-located]')"
+        )
+        .await,
+        Value::Null
+    );
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_find_label_falls_back_to_adjacent_text_ignoring_trailing_punctuation() {
+    let mut state = launch_with_page(NEAR_PAGE).await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "getbylabel", "label": "邮箱", "subaction": "fill", "value": "a@b.c" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('email').value").await,
+        json!("a@b.c")
+    );
+
+    let resp = command(
+        &mut state,
+        json!({ "action": "getbylabel", "label": "城市", "subaction": "fill", "value": "广州" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('city').value").await,
+        json!("广州")
+    );
+
+    let resp = command(
+        &mut state,
+        json!({ "action": "getbylabel", "label": "Named", "subaction": "fill", "value": "x" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('named').value").await,
+        json!("x")
+    );
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_find_label_and_near_refuse_to_guess_between_matching_controls() {
+    let mut state = launch_with_page(NEAR_PAGE).await;
+    for (action, key) in [("getbylabel", "label"), ("getbynear", "text")] {
+        let resp = command(
+            &mut state,
+            json!({ "action": action, key: "备注", "subaction": "fill", "value": "x" }),
+        )
+        .await;
+        assert_eq!(resp["success"], false, "{resp}");
+        let error = resp["error"].as_str().unwrap_or_default();
+        assert!(error.contains("matches 2 controls"), "{error}");
+    }
+    assert_eq!(
+        evaluate(
+            &mut state,
+            "document.getElementById('note1').value + document.getElementById('note2').value"
+        )
+        .await,
+        json!("")
+    );
+    let _ = close_current_browser(&mut state).await;
+}
+
+const HUMAN_PAGE: &str = r#"<!doctype html><body style="margin:0">
+<button id="b" style="position:absolute;left:400px;top:300px;width:120px;height:40px">Go</button>
+<input id="t" style="position:absolute;left:20px;top:20px"><input id="p" type="password" style="position:absolute;left:20px;top:60px">
+<div id="c" style="position:absolute;left:20px;top:100px;width:200px" contenteditable="true"></div></body>"#;
+
+#[tokio::test]
+#[ignore]
+async fn e2e_human_click_lands_inside_the_target_after_a_curved_approach() {
+    let mut state = launch_with_page(HUMAN_PAGE).await;
+    evaluate(
+        &mut state,
+        "window.M=[];window.D=[];document.addEventListener('mousemove',e=>M.push([e.clientX,e.clientY]));document.addEventListener('mousedown',e=>D.push(['d',performance.now()]));document.addEventListener('mouseup',e=>D.push(['u',performance.now()]));document.getElementById('b').addEventListener('click',e=>{window.C=[e.clientX,e.clientY,e.isTrusted]});1",
+    )
+    .await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "click", "selector": "#b", "inputMode": "human", "seed": 11 }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["verified"], true);
+    let landing = evaluate(&mut state, "C").await;
+    assert!(
+        landing[0].as_f64().unwrap() >= 400.0 && landing[0].as_f64().unwrap() <= 520.0,
+        "{landing}"
+    );
+    assert!(
+        landing[1].as_f64().unwrap() >= 300.0 && landing[1].as_f64().unwrap() <= 340.0,
+        "{landing}"
+    );
+    assert_eq!(landing[2], true);
+    let moves = evaluate(&mut state, "M.length").await.as_u64().unwrap();
+    assert!(moves >= 15, "only {moves} move events");
+    let hold = evaluate(&mut state, "D[1][1]-D[0][1]")
+        .await
+        .as_f64()
+        .unwrap();
+    assert!(hold >= 30.0, "button held for only {hold} ms");
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_human_typing_reaches_the_exact_text_and_never_mistypes_a_password() {
+    let mut state = launch_with_page(HUMAN_PAGE).await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "type", "selector": "#t", "text": "Hi, 你好 there", "inputMode": "human", "seed": 3 }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["verified"], true);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('t').value").await,
+        json!("Hi, 你好 there")
+    );
+
+    evaluate(&mut state, "window.B=0;document.getElementById('p').addEventListener('keydown',e=>{if(e.key==='Backspace')B++});1").await;
+    let resp = command(
+        &mut state,
+        json!({ "action": "type", "selector": "#p", "text": "S3cret!pw-with-a-rather-long-tail-of-letters", "inputMode": "human", "humanProfile": "careful", "seed": 99 }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["receipt"]["verified"], true);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('p').value").await,
+        json!("S3cret!pw-with-a-rather-long-tail-of-letters")
+    );
+    assert_eq!(evaluate(&mut state, "B").await, json!(0));
+    let _ = close_current_browser(&mut state).await;
 }
