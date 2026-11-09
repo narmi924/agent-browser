@@ -18,6 +18,7 @@ pub mod diff;
 pub mod downloads;
 #[allow(dead_code)]
 pub mod element;
+pub mod flow;
 #[allow(dead_code)]
 pub mod human;
 #[allow(dead_code)]
