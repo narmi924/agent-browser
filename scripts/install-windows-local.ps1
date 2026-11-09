@@ -3,6 +3,7 @@
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+if ((& git -C $repo branch --show-current).Trim() -ne 'personal') { throw 'Install only from the personal branch.' }
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 $vcvars = @('C:\Program Files\Microsoft Visual Studio', 'C:\Program Files (x86)\Microsoft Visual Studio') |
