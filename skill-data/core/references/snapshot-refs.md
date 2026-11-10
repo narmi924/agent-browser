@@ -188,7 +188,7 @@ agent-browser click @e5
 ```
 
 **Key details:**
-- Only one level of iframe nesting is expanded (iframes within iframes are not recursed)
+- Frames inside frames are expanded too, up to six levels deep. A same-process frame inside a cross-site frame stays unexpanded
 - Cross-origin iframes that block accessibility tree access are silently skipped
 - Empty iframes or iframes with no interactive content are omitted from the output
 - To scope a snapshot to a single iframe, use `frame @ref` then `snapshot -i`

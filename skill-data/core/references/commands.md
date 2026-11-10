@@ -99,6 +99,8 @@ For `fill` and `type`, put options before the optional `--` marker. Text after t
 
 Visible-label matching treats non-breaking and ordinary spaces equivalently.
 
+`fill` and `type` fail when the target cannot take focus because it is hidden or disabled; they do not type into whichever field holds the focus. `fill` sets a date, time, month, week, color, range or select field directly, for example `agent-browser fill @e5 "1998-03-15"`. A value in the wrong format fails, names the expected format and leaves the field as it was. On an editable region, `fill` replaces the existing content.
+
 Clicks fail before dispatch when another element covers the target's click point. The error names the covering element, for example `covered by <div#consent-banner>`. Dismiss or interact with that element, run a fresh snapshot, then retry the original action. Click and dblclick fail, instead of reporting success, when the element is hidden, disabled, or outside the viewport. `click --new-tab` opens the link's URL directly, so these checks do not apply to it.
 
 ## Get Information
@@ -342,7 +344,7 @@ agent-browser frame main          # Back to main frame
 
 ### Iframe support
 
-Iframes are detected automatically during snapshots. When the main-frame snapshot runs, `Iframe` nodes are resolved and their content is inlined beneath the iframe element in the output (one level of nesting; iframes within iframes are not expanded).
+Iframes are detected automatically during snapshots. When the main-frame snapshot runs, `Iframe` nodes are resolved and their content is inlined beneath the iframe element in the output (frames inside frames are followed too, up to six levels deep).
 
 ```bash
 agent-browser snapshot -i

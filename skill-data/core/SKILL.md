@@ -122,6 +122,7 @@ Use `read` for documentation and other text pages. A read with a URL fetches ove
 agent-browser click @e1                   # click
 agent-browser click @e1 --new-tab         # open a link in a new tab
 agent-browser fill @e2 "hello"            # clear, then type
+agent-browser fill @e5 "1998-03-15"       # date, time, color, range and select fields take the value directly
 agent-browser type @e2 " world"           # type without clearing
 agent-browser press Enter                 # key at current focus (Control+a for combos)
 agent-browser select @e4 "option-value"   # by value or visible label

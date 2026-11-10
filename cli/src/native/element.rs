@@ -498,13 +498,12 @@ pub async fn resolve_element_point(
                 .await;
 
             if let Ok(r) = result {
-                let (x, y) = box_model_center(&r.model);
                 let resolved = check_node_interception(
                     client,
                     effective_session_id,
                     backend_node_id,
                     selector_or_ref,
-                    (x, y),
+                    &r.model,
                     require_actionable,
                     jitter,
                 )
@@ -540,13 +539,12 @@ pub async fn resolve_element_point(
                 Some(effective_session_id),
             )
             .await?;
-        let (x, y) = box_model_center(&result.model);
         let resolved = check_node_interception(
             client,
             effective_session_id,
             fresh_id,
             selector_or_ref,
-            (x, y),
+            &result.model,
             require_actionable,
             jitter,
         )
@@ -670,11 +668,12 @@ async fn check_node_interception(
     session_id: &str,
     backend_node_id: i64,
     target: &str,
-    center: (f64, f64),
+    model: &BoxModel,
     require_actionable: bool,
     jitter: Option<(f64, f64)>,
 ) -> Result<ResolvedPoint, String> {
-    let (x, y) = center;
+    let (x, y) = box_model_center(model);
+    let (left, top) = quad_origin(&model.border);
     let fallback = ResolvedPoint { x, y, size: 0.0 };
     let resolved: Result<DomResolveNodeResult, String> = client
         .send_command_typed(
@@ -697,14 +696,37 @@ async fn check_node_interception(
     // hit-test starts from the top document. For an OOPIF node the
     // frameElement walk stops at the process boundary, where the frame's own
     // document and session-local coordinates are already consistent.
+    //
+    // A frame embedded by another origin in the same process also hides its
+    // frameElement, but its box model still starts at the top viewport. The
+    // distance between the box model and the element's own rectangle is that
+    // frame's origin: resolve in the frame's coordinates and add it back.
     let function = format!(
-        r#"function(x, y, jitter) {{
+        r#"function(x, y, left, top, jitter) {{
             let topDoc = this.ownerDocument || document;
             while (topDoc.defaultView && topDoc.defaultView.frameElement) {{
                 topDoc = topDoc.defaultView.frameElement.ownerDocument;
             }}
             const resolvePoint = {RESOLVE_CLICK_POINT_JS};
-            return resolvePoint(topDoc, this, x, y, jitter);
+            let ox = 0, oy = 0;
+            const view = topDoc.defaultView;
+            if (view && view.parent !== view && this.getBoundingClientRect) {{
+                const rect = this.getBoundingClientRect();
+                let lx = rect.left, ly = rect.top;
+                for (let v = this.ownerDocument.defaultView; v && v.frameElement; v = v.frameElement.ownerDocument.defaultView) {{
+                    const frame = v.frameElement.getBoundingClientRect();
+                    lx += frame.left + v.frameElement.clientLeft;
+                    ly += frame.top + v.frameElement.clientTop;
+                }}
+                if (Math.abs(left - lx) > 1 || Math.abs(top - ly) > 1) {{
+                    ox = left - lx;
+                    oy = top - ly;
+                }}
+            }}
+            const out = resolvePoint(topDoc, this, x - ox, y - oy, jitter);
+            out.x += ox;
+            out.y += oy;
+            return out;
         }}"#,
     );
     let result = client
@@ -716,6 +738,8 @@ async fn check_node_interception(
                 "arguments": [
                     { "value": x },
                     { "value": y },
+                    { "value": left },
+                    { "value": top },
                     { "value": jitter.map(|(u, v)| vec![u, v]) },
                 ],
                 "returnByValue": true,
@@ -1356,6 +1380,22 @@ fn not_actionable_error(target: &str, reason: &str) -> String {
         "Element '{}' is {}, so the click would not reach it",
         target, reason
     )
+}
+
+/// Top-left corner of the box that bounds a quad.
+fn quad_origin(quad: &[f64]) -> (f64, f64) {
+    let corner = |offset: usize| {
+        quad.iter()
+            .skip(offset)
+            .step_by(2)
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+    };
+    if quad.len() >= 8 {
+        (corner(0), corner(1))
+    } else {
+        (0.0, 0.0)
+    }
 }
 
 fn box_model_center(model: &BoxModel) -> (f64, f64) {

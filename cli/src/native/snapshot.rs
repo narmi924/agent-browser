@@ -433,6 +433,9 @@ impl RoleNameTracker {
     }
 }
 
+/// How many frames deep a page read follows frames nested inside frames.
+const MAX_FRAME_DEPTH: usize = 6;
+
 pub async fn take_snapshot(
     client: &CdpClient,
     session_id: &str,
@@ -440,6 +443,27 @@ pub async fn take_snapshot(
     ref_map: &mut RefMap,
     frame_id: Option<&str>,
     iframe_sessions: &HashMap<String, String>,
+) -> Result<String, String> {
+    take_frame_snapshot(
+        client,
+        session_id,
+        options,
+        ref_map,
+        frame_id,
+        iframe_sessions,
+        0,
+    )
+    .await
+}
+
+async fn take_frame_snapshot(
+    client: &CdpClient,
+    session_id: &str,
+    options: &SnapshotOptions,
+    ref_map: &mut RefMap,
+    frame_id: Option<&str>,
+    iframe_sessions: &HashMap<String, String>,
+    depth: usize,
 ) -> Result<String, String> {
     client
         .send_command_no_params("DOM.enable", Some(session_id))
@@ -760,10 +784,10 @@ pub async fn take_snapshot(
     }
 
     // Recurse into child iframes: for each Iframe node with a backend_node_id,
-    // resolve the child frame ID and take a snapshot of its content.
-    // We only recurse from the main frame (frame_id == None) to avoid
-    // unbounded depth; nested iframes within iframes are not expanded.
-    if frame_id.is_none() {
+    // resolve the child frame ID and take a snapshot of its content. A frame
+    // read as part of a page follows its own frames too, up to
+    // MAX_FRAME_DEPTH; a frame read on its own (`frame <sel>`) does not.
+    if frame_id.is_none() || (depth > 0 && depth < MAX_FRAME_DEPTH) {
         let mut iframe_snapshots: Vec<(String, String)> = Vec::new(); // (ref_id, child_snapshot)
         for node in tree_nodes.iter() {
             if node.role != "Iframe" || !node.has_ref {
@@ -773,16 +797,26 @@ pub async fn take_snapshot(
                 continue;
             };
             let ref_id = node.ref_id.as_deref().unwrap_or("");
-            if let Ok(child_fid) = resolve_iframe_frame_id(client, session_id, bid).await {
+            if let Ok(child_fid) = resolve_iframe_frame_id(client, effective_session_id, bid).await
+            {
+                // Refs later find a frame's session by frame id alone: its own
+                // session when it runs out of process, otherwise the page's.
+                // A same-process frame inside an out-of-process frame fits
+                // neither, so it stays unexpanded rather than yield refs that
+                // would resolve against the wrong document.
+                if effective_session_id != session_id && !iframe_sessions.contains_key(&child_fid) {
+                    continue;
+                }
                 // Snapshot the child frame; errors are silently ignored
                 // (e.g. cross-origin iframes)
-                if let Ok(child_text) = Box::pin(take_snapshot(
+                if let Ok(child_text) = Box::pin(take_frame_snapshot(
                     client,
                     session_id,
                     options,
                     ref_map,
                     Some(&child_fid),
                     iframe_sessions,
+                    depth + 1,
                 ))
                 .await
                 {

@@ -15204,6 +15204,174 @@ async fn e2e_fill_read_back_is_verified_and_a_rejecting_field_is_not() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_fill_sets_picker_inputs_and_refuses_a_field_that_cannot_take_focus() {
+    let mut state = launch_with_page(
+        r#"<input id="phone"><input id="birth" type="date"><input id="volume" type="range" min="0" max="100">
+<div hidden><input id="gone"></div><div id="editor" contenteditable>old text</div>"#,
+    )
+    .await;
+    evaluate(
+        &mut state,
+        "window.E=[];for(const id of ['birth','volume'])document.getElementById(id).addEventListener('change',e=>E.push(id+'='+e.target.value));1",
+    )
+    .await;
+    for (selector, value) in [
+        ("#phone", "139"),
+        ("#birth", "1998-03-15"),
+        ("#volume", "70"),
+    ] {
+        let resp = command(
+            &mut state,
+            json!({ "action": "fill", "selector": selector, "value": value }),
+        )
+        .await;
+        assert_success(&resp);
+        assert_eq!(get_data(&resp)["receipt"]["verified"], true, "{selector}");
+    }
+    assert_eq!(
+        evaluate(&mut state, "E.join()").await,
+        json!("birth=1998-03-15,volume=70")
+    );
+
+    let resp = command(
+        &mut state,
+        json!({ "action": "fill", "selector": "#birth", "value": "15/03/1998" }),
+    )
+    .await;
+    assert_eq!(resp["success"], false, "{resp}");
+    assert!(resp["error"].as_str().unwrap().contains("YYYY-MM-DD"));
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('birth').value").await,
+        json!("1998-03-15")
+    );
+
+    evaluate(&mut state, "document.getElementById('phone').focus();1").await;
+    for action in ["fill", "type"] {
+        let resp = command(
+            &mut state,
+            json!({ "action": action, "selector": "#gone", "value": "leak", "text": "leak" }),
+        )
+        .await;
+        assert_eq!(resp["success"], false, "{action}: {resp}");
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot take focus"),
+            "{resp}"
+        );
+    }
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('phone').value").await,
+        json!("139")
+    );
+
+    let resp = command(
+        &mut state,
+        json!({ "action": "fill", "selector": "#editor", "value": "new text" }),
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        evaluate(&mut state, "document.getElementById('editor').textContent").await,
+        json!("new text")
+    );
+    let _ = close_current_browser(&mut state).await;
+}
+
+/// Serves `page(path, port)` on a loopback port until the task is aborted.
+async fn serve_fixture_pages(page: fn(&str, u16) -> String) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 4096];
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let body = page(path, port);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (port, server)
+}
+
+/// A top page that embeds a frame from another origin of the same site, which
+/// embeds a frame from another site. The heading pushes the frames down, so a
+/// point in a frame's own coordinates misses its button in the top viewport.
+fn nested_frame_fixture(path: &str, port: u16) -> String {
+    if path == "/leaf" {
+        return "<!doctype html><button onclick=\"top.postMessage('leaf','*')\">Leaf button</button>".to_string();
+    }
+    if path == "/middle" {
+        return format!(
+            "<!doctype html><button onclick=\"top.postMessage('middle','*')\">Middle button</button><iframe src='http://localhost:{port}/leaf' width='300' height='60'></iframe>"
+        );
+    }
+    let middle_port = path.trim_start_matches("/?middle=");
+    format!(
+        "<!doctype html><h1 style='height:180px'>Top</h1><iframe src='http://127.0.0.1:{middle_port}/middle' width='400' height='140'></iframe><script>window.got=[];addEventListener('message',e=>got.push(e.data))</script>"
+    )
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_snapshot_reads_nested_frames_and_clicks_land_inside_them() {
+    let (top_port, top_server) = serve_fixture_pages(nested_frame_fixture).await;
+    let (middle_port, middle_server) = serve_fixture_pages(nested_frame_fixture).await;
+    let mut state = DaemonState::new();
+    for body in [
+        json!({"id": "1", "action": "launch", "headless": true}),
+        json!({"id": "2", "action": "navigate", "url": format!("http://127.0.0.1:{top_port}/?middle={middle_port}")}),
+    ] {
+        assert_success(&execute_command(&body, &mut state).await);
+    }
+    let mut refs = serde_json::Map::new();
+    for _ in 0..40 {
+        let snapshot = command(&mut state, json!({"action": "snapshot"})).await;
+        assert_success(&snapshot);
+        refs = get_data(&snapshot)["refs"].as_object().unwrap().clone();
+        if refs.values().any(|node| node["name"] == "Leaf button") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    for name in ["Middle button", "Leaf button"] {
+        let reference = refs
+            .iter()
+            .find(|(_, node)| node["role"] == "button" && node["name"] == name)
+            .map(|(reference, _)| format!("@{reference}"))
+            .unwrap_or_else(|| panic!("{name} is missing from the snapshot: {refs:?}"));
+        let click = command(
+            &mut state,
+            json!({"action": "click", "selector": reference}),
+        )
+        .await;
+        assert_success(&click);
+    }
+    let mut got = Value::Null;
+    for _ in 0..40 {
+        got = evaluate(&mut state, "got.join()").await;
+        if got == json!("middle,leaf") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(got, json!("middle,leaf"));
+    let _ = close_current_browser(&mut state).await;
+    top_server.abort();
+    middle_server.abort();
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_receipts_cover_select_check_upload_and_reported_effects() {
     let mut state = launch_with_page(
         r##"<select id="s"><option value="1">One</option><option value="2">Two</option></select>

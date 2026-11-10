@@ -287,26 +287,38 @@ pub async fn fill(
     )
     .await?;
 
-    // Focus and clear in one round trip.
-    client
-        .send_command_typed::<_, Value>(
+    let prepared: Value = client
+        .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: r#"function() {
-                    this.focus();
-                    this.select && this.select();
-                    this.value = '';
-                    this.dispatchEvent(new Event('input', { bubbles: true }));
-                }"#
-                .to_string(),
+                function_declaration: PREPARE_FILL_JS.to_string(),
                 object_id: Some(object_id),
-                arguments: None,
+                arguments: Some(vec![CallArgument {
+                    value: Some(Value::String(value.to_string())),
+                    object_id: None,
+                }]),
                 return_by_value: Some(true),
                 await_promise: Some(false),
             },
             Some(&effective_session_id),
         )
         .await?;
+    match prepared.pointer("/result/value").and_then(Value::as_str) {
+        Some("set") => return Ok(()),
+        Some("unfocused") => {
+            return Err(format!(
+                "Element {selector_or_ref} cannot take focus (hidden, disabled or not a field), so nothing was filled"
+            ))
+        }
+        Some(kind) if kind.starts_with("rejected:") => {
+            let kind = &kind["rejected:".len()..];
+            return Err(format!(
+                "The {kind} field did not accept this value. It takes {}",
+                picker_value_format(kind)
+            ));
+        }
+        _ => {}
+    }
 
     // Insert text (keyboard input dispatched at page level, use parent session_id)
     client
@@ -320,6 +332,77 @@ pub async fn fill(
         .await?;
 
     Ok(())
+}
+
+/// Readies a field for `fill`. Inserted text goes to whatever holds the focus,
+/// so a field that cannot take it is reported instead of letting the text land
+/// in another field. A picker input (date, time, color, range) has no text to
+/// type into: its value is set directly, with the events a person's choice fires.
+const PREPARE_FILL_JS: &str = r#"function(value) {
+    const el = this;
+    const pickers = ['date', 'time', 'datetime-local', 'month', 'week', 'color', 'range'];
+    if (el.tagName === 'INPUT' && pickers.includes(el.type)) {
+        if (el.disabled || el.readOnly) return 'unfocused';
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        const before = el.value;
+        setter.call(el, value);
+        if (el.value.toLowerCase() !== String(value).toLowerCase()) {
+            setter.call(el, before);
+            return 'rejected:' + el.type;
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return 'set';
+    }
+    if (el.tagName === 'SELECT') {
+        const wanted = String(value).trim();
+        const option = Array.from(el.options).find((o) => o.value === value || o.label.trim() === wanted);
+        if (el.disabled) return 'unfocused';
+        if (!option || option.disabled) return 'rejected:select';
+        for (const o of el.options) o.selected = o === option;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return 'set';
+    }
+    if (typeof el.focus !== 'function') return 'unfocused';
+    const focused = () => {
+        let active = el.ownerDocument.activeElement;
+        while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement;
+        return active;
+    };
+    // A field may hand the focus on to the control that really takes the text.
+    // Only a focus that did not move at all means this field cannot take it.
+    const before = focused();
+    el.focus();
+    const after = focused();
+    if (after !== el && after === before) return 'unfocused';
+    if (el.isContentEditable) {
+        const doc = el.ownerDocument;
+        const range = doc.createRange();
+        range.selectNodeContents(el);
+        const selection = doc.defaultView.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        if (!selection.isCollapsed) doc.execCommand('delete');
+        return 'ready';
+    }
+    el.select && el.select();
+    el.value = '';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    return 'ready';
+}"#;
+
+fn picker_value_format(kind: &str) -> &'static str {
+    match kind {
+        "date" => "YYYY-MM-DD.",
+        "time" => "HH:MM.",
+        "datetime-local" => "YYYY-MM-DDTHH:MM.",
+        "month" => "YYYY-MM.",
+        "week" => "YYYY-Www, for example 2026-W05.",
+        "color" => "#rrggbb.",
+        "select" => "one of its options, by label or value.",
+        _ => "a number inside its range.",
+    }
 }
 
 /// Focus a field and optionally clear it, ready for keystrokes.
@@ -340,12 +423,25 @@ pub async fn prepare_type_target(
     )
     .await?;
 
-    // Focus
-    client
-        .send_command_typed::<_, Value>(
+    // Keystrokes go to whatever holds the focus. When the target cannot take
+    // it and another field holds it, typing would fill that field instead.
+    let focused: Value = client
+        .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: "function() { this.focus(); }".to_string(),
+                function_declaration: r#"function() {
+                    const focused = () => {
+                        let active = this.ownerDocument.activeElement;
+                        while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement;
+                        return active;
+                    };
+                    const before = focused();
+                    this.focus();
+                    const active = focused();
+                    if (!active || active === this || active !== before || active.contains(this)) return true;
+                    return !(active.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName));
+                }"#
+                .to_string(),
                 object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
@@ -354,6 +450,11 @@ pub async fn prepare_type_target(
             Some(&effective_session_id),
         )
         .await?;
+    if focused.pointer("/result/value").and_then(Value::as_bool) == Some(false) {
+        return Err(format!(
+            "Element {selector_or_ref} cannot take focus (hidden, disabled or not a field), and another field holds it, so nothing was typed"
+        ));
+    }
 
     if clear {
         client
