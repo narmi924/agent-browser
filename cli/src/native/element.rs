@@ -474,6 +474,7 @@ pub async fn resolve_element_point(
         session_id: session.to_string(),
         target_size: resolved.size,
     };
+    wait_for_page_transition(client, session_id).await;
     if let Some(ref_id) = parse_ref(selector_or_ref) {
         let entry = ref_map
             .get(&ref_id)
@@ -757,6 +758,31 @@ async fn check_node_interception(
         .unwrap_or(Value::Null);
     Ok(parse_resolved_point(&value, target, require_actionable)?.unwrap_or(fallback))
 }
+
+/// While a view transition runs, the page shows a captured image that takes
+/// every hit, so input sent then reaches no element. Wait for it to finish,
+/// at most `PAGE_TRANSITION_WAIT_MS`. Best effort: a page without one, or a
+/// failed evaluation, returns at once.
+async fn wait_for_page_transition(client: &CdpClient, session_id: &str) {
+    let expression = format!(
+        "(async () => {{ const t = document.activeViewTransition; if (!t) return false; \
+         await Promise.race([t.finished.catch(() => {{}}), new Promise(r => setTimeout(r, {PAGE_TRANSITION_WAIT_MS}))]); \
+         return true; }})()"
+    );
+    let _ = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(serde_json::json!({
+                "expression": expression,
+                "awaitPromise": true,
+                "returnByValue": true,
+            })),
+            Some(session_id),
+        )
+        .await;
+}
+
+const PAGE_TRANSITION_WAIT_MS: u64 = 3000;
 
 /// Coordinates from DOM.getBoxModel are viewport-relative, and input events
 /// only land inside the viewport, so make sure the node is visible first.
@@ -1126,9 +1152,11 @@ const RESOLVE_CLICK_POINT_JS: &str = r#"(topDoc, el, x0, y0, jitter) => {
         try { return el.ownerDocument.defaultView.getComputedStyle(el).pointerEvents === 'none'; }
         catch (e) { return false; }
     };
+    const origin = (el.tagName || '').startsWith('::') ? el.parentElement : null;
     const reaches = (hit) => {
         if (!hit) return false;
         if (within(el, hit)) return true;
+        if (origin && hit === origin) return true;
         const hitLabel = hit.closest ? hit.closest('label') : null;
         if (hitLabel && (hitLabel.control === el || hitLabel.contains(el))) return true;
         const elLabel = el.closest ? el.closest('label') : null;
@@ -1232,6 +1260,10 @@ const RESOLVE_CLICK_POINT_JS: &str = r#"(topDoc, el, x0, y0, jitter) => {
     };
     const out = { x: x0, y: y0, size: 0 };
     try {
+        if (!el.getBoundingClientRect) {
+            out.reason = 'a CSS-generated part the browser reports no position for (scroll its target into view instead)';
+            return out;
+        }
         const view = el.ownerDocument.defaultView;
         const rect = el.getBoundingClientRect();
         out.size = Math.min(rect.width, rect.height);
@@ -1239,6 +1271,18 @@ const RESOLVE_CLICK_POINT_JS: &str = r#"(topDoc, el, x0, y0, jitter) => {
             || ['hidden', 'collapse'].includes(view.getComputedStyle(el).visibility);
         if (hidden) out.reason = 'not visible';
         else if (el.disabled || el.matches(':disabled')) out.reason = 'disabled';
+        if (!out.reason && el.checkVisibility && !el.checkVisibility()) {
+            const closed = el.closest('details:not([open])');
+            const summary = closed ? closed.querySelector(':scope > summary') : null;
+            if (closed && !(summary && summary.contains(el))) {
+                const label = summary ? summary.textContent.trim().slice(0, 40) : '';
+                out.reason = 'inside a collapsed <details>' + (label ? ' (click its summary "' + label + '" first)' : '');
+            } else if (el.closest('[hidden="until-found"]')) {
+                out.reason = 'hidden until found (reveal its hidden="until-found" section first)';
+            } else {
+                out.reason = 'not rendered';
+            }
+        }
         const noBox = rect.width <= 0 || rect.height <= 0;
         let centreHit = hitAt(topDoc, x0, y0);
         let landed = noBox ? (!centreHit || reaches(centreHit) || within(centreHit, el)) : reaches(centreHit);
@@ -1260,6 +1304,8 @@ const RESOLVE_CLICK_POINT_JS: &str = r#"(topDoc, el, x0, y0, jitter) => {
                 out.x = landing.x;
                 out.y = landing.y;
             }
+        } else if (!out.reason && topDoc.activeViewTransition) {
+            out.reason = 'under a page transition that is still running (retry once it finishes)';
         } else if (centreHit) {
             out.blocker = describe(centreHit);
         } else if (!out.reason) {

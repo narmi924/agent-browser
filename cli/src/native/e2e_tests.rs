@@ -17559,3 +17559,126 @@ async fn e2e_flow_a_route_limited_by_resource_type_applies_the_same_on_both_tier
     }
     let _ = exec(&run(&mut n, json!({ "action": "close" })), &mut state).await;
 }
+
+async fn launch_with_html(state: &mut DaemonState, html: &str) {
+    let resp = execute_command(
+        &json!({ "id": "launch", "action": "launch", "headless": true }),
+        state,
+    )
+    .await;
+    assert_success(&resp);
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "navigate", "action": "navigate", "url": url }),
+        state,
+    )
+    .await;
+    assert_success(&resp);
+}
+
+async fn ref_named(state: &mut DaemonState, role: &str, name: &str) -> String {
+    let resp = execute_command(
+        &json!({ "id": "snap", "action": "snapshot", "interactive": true }),
+        state,
+    )
+    .await;
+    assert_success(&resp);
+    let refs = get_data(&resp)["refs"].as_object().expect("refs").clone();
+    refs.iter()
+        .find(|(_, meta)| meta["role"] == role && meta["name"] == name)
+        .map(|(reference, _)| format!("@{reference}"))
+        .unwrap_or_else(|| panic!("no {role} named {name} in {refs:?}"))
+}
+
+async fn eval_value(state: &mut DaemonState, script: &str) -> Value {
+    let resp = execute_command(
+        &json!({ "id": "eval", "action": "evaluate", "script": script }),
+        state,
+    )
+    .await;
+    assert_success(&resp);
+    get_data(&resp)["result"].clone()
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_click_reaches_a_css_carousel_scroll_button() {
+    let mut state = DaemonState::new();
+    let html = r#"
+        <style>
+          #track { display: flex; width: 300px; overflow-x: auto; scroll-snap-type: x mandatory; }
+          .slide { flex: 0 0 280px; height: 80px; scroll-snap-align: start; }
+          #track::scroll-button(right) { content: ">" / "Next slide"; }
+          #track::scroll-button(left) { content: "<" / "Previous slide"; }
+        </style>
+        <div id="track"><div class="slide">1</div><div class="slide">2</div><div class="slide">3</div></div>
+    "#;
+    launch_with_html(&mut state, html).await;
+    let next = ref_named(&mut state, "button", "Next slide").await;
+    let resp = execute_command(
+        &json!({ "id": "click", "action": "click", "selector": next }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let moved = eval_value(
+        &mut state,
+        "new Promise(r => setTimeout(() => r(document.getElementById('track').scrollLeft), 600))",
+    )
+    .await;
+    assert!(
+        moved.as_f64().unwrap_or(0.0) > 0.0,
+        "the carousel should scroll: {moved}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_click_inside_a_collapsed_details_names_its_summary() {
+    let mut state = DaemonState::new();
+    let html = r#"
+        <details><summary>Shipping</summary><button id="rates" onclick="document.title = 'clicked'">Rates</button></details>
+    "#;
+    launch_with_html(&mut state, html).await;
+    let resp = execute_command(
+        &json!({ "id": "click", "action": "click", "selector": "#rates" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false, "a collapsed target must not click: {resp}");
+    let error = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("inside a collapsed <details>") && error.contains("Shipping"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(eval_value(&mut state, "document.title").await, "");
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_click_waits_for_a_running_page_transition() {
+    let mut state = DaemonState::new();
+    let html = r#"
+        <style>::view-transition-old(root), ::view-transition-new(root) { animation-duration: 1.2s; }</style>
+        <main id="view"><button id="open">Open</button></main>
+        <script>
+          document.getElementById('open').onclick = () => document.startViewTransition(() => {
+            document.getElementById('view').innerHTML = '<button id="save" onclick="document.title = \'saved\'">Save</button>';
+          });
+        </script>
+    "#;
+    launch_with_html(&mut state, html).await;
+    let resp = execute_command(
+        &json!({ "id": "open", "action": "click", "selector": "#open" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "save", "action": "click", "selector": "#save" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(eval_value(&mut state, "document.title").await, "saved");
+}
