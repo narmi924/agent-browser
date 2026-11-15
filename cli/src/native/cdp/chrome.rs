@@ -439,6 +439,9 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "NetworkServiceInProcess".to_string(),
     ];
     if options.webmcp {
+        // Chrome 157 renamed the page API feature to WebMCP and no longer
+        // reads WebMCPTesting; older builds ignore the name they do not know.
+        enable_features.push("WebMCP".to_string());
         enable_features.push("WebMCPTesting".to_string());
         enable_features.push("DevToolsWebMCPSupport".to_string());
     }
@@ -2530,8 +2533,13 @@ exec sleep 60
             .iter()
             .find(|arg| arg.starts_with("--enable-features="))
             .unwrap();
-        assert!(features.contains("WebMCPTesting"));
-        assert!(features.contains("DevToolsWebMCPSupport"));
+        let names: Vec<&str> = features
+            .trim_start_matches("--enable-features=")
+            .split(',')
+            .collect();
+        assert!(names.contains(&"WebMCP"));
+        assert!(names.contains(&"WebMCPTesting"));
+        assert!(names.contains(&"DevToolsWebMCPSupport"));
     }
 
     #[test]
@@ -2546,8 +2554,13 @@ exec sleep 60
             .iter()
             .find(|arg| arg.starts_with("--enable-features="))
             .unwrap();
-        assert!(!features.contains("WebMCPTesting"));
-        assert!(!features.contains("DevToolsWebMCPSupport"));
+        let names: Vec<&str> = features
+            .trim_start_matches("--enable-features=")
+            .split(',')
+            .collect();
+        assert!(!names.contains(&"WebMCP"));
+        assert!(!names.contains(&"WebMCPTesting"));
+        assert!(!names.contains(&"DevToolsWebMCPSupport"));
     }
 
     #[test]
