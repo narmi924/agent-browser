@@ -21,14 +21,25 @@ use super::pointer::{ClickSpec, Modifiers, MouseButton};
 /// acknowledgement only arrives after about five seconds.
 const MOUSE_MOVE_ACK_GRACE: Duration = Duration::from_millis(250);
 
+/// How much longer a move keeps waiting once the tab reports itself visible.
+/// A visible tab whose renderer is busy, as right after a click, can take
+/// close to 300 ms to acknowledge, and a move sent before that lands is
+/// coalesced with the next one.
+const VISIBLE_MOVE_ACK_LIMIT: Duration = Duration::from_secs(1);
+
+/// How long the visibility check may take. A JavaScript dialog opened by a
+/// mouse-move handler blocks it, and the tab then counts as not visible.
+const VISIBILITY_CHECK_LIMIT: Duration = Duration::from_millis(250);
+
 /// How long a click waits for the move that precedes it. The press sent next
 /// flushes any queued move, so this wait exists only to notice a dialog opened
 /// by a mouse-move handler before pressing.
 const CLICK_MOVE_ACK_GRACE: Duration = Duration::from_millis(15);
 
-/// Sends the pointer moves of one movement. The first move that goes
-/// unacknowledged for `MOUSE_MOVE_ACK_GRACE` marks the tab as hidden, and the
-/// rest of the movement is sent without waiting.
+/// Sends the pointer moves of one movement. A move still unacknowledged after
+/// `MOUSE_MOVE_ACK_GRACE` keeps waiting only while the tab reports itself
+/// visible; otherwise the tab counts as hidden and the rest of the movement
+/// is sent without waiting.
 pub struct MouseMoves {
     wait_for_ack: bool,
 }
@@ -58,17 +69,35 @@ impl MouseMoves {
             params,
             Some(session_id),
         );
-        match tokio::time::timeout(MOUSE_MOVE_ACK_GRACE, send).await {
-            Ok(result) => {
+        tokio::pin!(send);
+        if let Ok(result) = tokio::time::timeout(MOUSE_MOVE_ACK_GRACE, &mut send).await {
+            result?;
+            return Ok(true);
+        }
+        if tab_reports_visible(client, session_id).await {
+            if let Ok(result) = tokio::time::timeout(VISIBLE_MOVE_ACK_LIMIT, &mut send).await {
                 result?;
-                Ok(true)
-            }
-            Err(_) => {
-                self.wait_for_ack = false;
-                Ok(false)
+                return Ok(true);
             }
         }
+        self.wait_for_ack = false;
+        Ok(false)
     }
+}
+
+async fn tab_reports_visible(client: &CdpClient, session_id: &str) -> bool {
+    let check = client.send_command(
+        "Runtime.evaluate",
+        Some(serde_json::json!({
+            "expression": "document.visibilityState",
+            "returnByValue": true
+        })),
+        Some(session_id),
+    );
+    matches!(
+        tokio::time::timeout(VISIBILITY_CHECK_LIMIT, check).await,
+        Ok(Ok(reply)) if reply.pointer("/result/value").and_then(Value::as_str) == Some("visible")
+    )
 }
 
 impl Default for MouseMoves {
@@ -2155,10 +2184,90 @@ mod tests {
             started.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let sent_moves = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "Input.dispatchMouseEvent")
+            .count();
+        assert_eq!(sent_moves, 3, "every move must still be sent");
+        server.abort();
+    }
+
+    /// Acknowledges every mouseMoved only after `delay` and reports the tab
+    /// visible, like a visible tab whose renderer is busy after a click.
+    async fn slow_visible_browser(
+        delay: Duration,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_for_server = log.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(text).unwrap();
+                log_for_server.lock().unwrap().push(request.clone());
+                let result = if request["method"] == "Runtime.evaluate" {
+                    serde_json::json!({ "result": { "type": "string", "value": "visible" } })
+                } else {
+                    tokio::time::sleep(delay).await;
+                    serde_json::json!({})
+                };
+                let reply = serde_json::json!({ "id": request["id"], "result": result });
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                    reply.to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+        (url, log, server)
+    }
+
+    /// A visible tab that acknowledges late keeps every move of the path
+    /// waited on, so Chrome does not coalesce them.
+    #[tokio::test]
+    async fn mouse_moves_keep_waiting_on_a_visible_tab_that_acknowledges_late() {
+        let (url, log, server) = slow_visible_browser(Duration::from_millis(380)).await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let params = DispatchMouseEventParams {
+            event_type: "mouseMoved".to_string(),
+            x: 1.0,
+            y: 2.0,
+            button: None,
+            buttons: None,
+            click_count: None,
+            delta_x: None,
+            delta_y: None,
+            modifiers: None,
+        };
+        let mut moves = MouseMoves::new();
+        assert!(moves.dispatch(&client, "S1", &params).await.unwrap());
+        assert!(moves.dispatch(&client, "S1", &params).await.unwrap());
+        let methods: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(
-            log.lock().unwrap().len(),
-            3,
-            "every move must still be sent"
+            methods,
+            [
+                "Input.dispatchMouseEvent",
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Runtime.evaluate"
+            ]
         );
         server.abort();
     }
