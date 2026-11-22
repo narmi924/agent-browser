@@ -32,4 +32,11 @@ Copy-Item $binary $target -Force
 if ((Get-FileHash $target).Hash -ne (Get-FileHash $binary).Hash) {
     throw "The installed binary at $target does not match this build."
 }
-Write-Output "Installed $target"
+
+# `agent-browser skills get` reads these folders from the package, so they must match the binary.
+foreach ($folder in 'skill-data', 'skills') {
+    $installed = Join-Path $package $folder
+    Remove-Item $installed -Recurse -Force -ErrorAction SilentlyContinue
+    Copy-Item (Join-Path $repo $folder) $installed -Recurse -Force
+}
+Write-Output "Installed $target and the skill files"
