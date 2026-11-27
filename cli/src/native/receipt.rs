@@ -5,7 +5,7 @@
 //!
 //! ```json
 //! { "verified": true,
-//!   "checks": [{ "name": "value", "expected": "abc", "actual": "abc", "ok": true }],
+//!   "checks": [{ "name": "value", "expected_length": 3, "actual_length": 3, "ok": true }],
 //!   "effects": { "url_changed": false, "new_tab": false, "dialog_opened": false,
 //!                "dom_changed": false, "target_removed": false } }
 //! ```
@@ -33,8 +33,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long a click waits for a tab or navigation it may have caused. Other
 /// actions read only what has already arrived.
 pub const CLICK_SETTLE: Duration = Duration::from_millis(12);
-
-const MAX_RECORDED_TEXT: usize = 200;
 
 /// Page-side probe. Runs against the target element and returns an object
 /// whose handle stays in the page until `READ_PROBE_JS` removes its listeners.
@@ -164,14 +162,6 @@ impl Verdict {
             (current, None) => current,
         };
     }
-}
-
-fn truncated(text: &str) -> String {
-    if text.chars().count() <= MAX_RECORDED_TEXT {
-        return text.to_string();
-    }
-    let head: String = text.chars().take(MAX_RECORDED_TEXT).collect();
-    format!("{head}...")
 }
 
 fn same_text(a: &str, b: &str) -> bool {
@@ -613,8 +603,9 @@ fn record_value(verdict: &mut Verdict, page: &Value, expected: Option<&str>) {
     record_redactable(verdict, page, "value", expected, actual, ok);
 }
 
-/// Report a value comparison, keeping the text out of the receipt for
-/// passwords, card numbers, and one-time codes.
+/// Report a value comparison. Field text never appears in the receipt, as in
+/// command warnings: an ordinary field reports the two lengths, and a
+/// password, card number, or one-time code reports nothing but the outcome.
 fn record_redactable(
     verdict: &mut Verdict,
     page: &Value,
@@ -626,7 +617,11 @@ fn record_redactable(
     let check = if page["sensitive"] == true {
         json!({ "name": name, "redacted": true })
     } else {
-        json!({ "name": name, "expected": truncated(expected), "actual": truncated(actual) })
+        json!({
+            "name": name,
+            "expected_length": expected.chars().count(),
+            "actual_length": actual.chars().count(),
+        })
     };
     verdict.push(Some(ok), check);
 }
@@ -666,15 +661,16 @@ mod tests {
     }
 
     #[test]
-    fn value_mismatch_is_verified_false_and_carries_both_values() {
+    fn value_mismatch_is_verified_false_and_reports_lengths_not_text() {
         let verdict = built(
             Expectation::Value("abc"),
             Some(page(json!({ "value": "ab" }))),
             Effects::default(),
         );
         assert_eq!(verdict.verified, Some(false));
-        assert_eq!(verdict.checks[0]["expected"], "abc");
-        assert_eq!(verdict.checks[0]["actual"], "ab");
+        assert_eq!(verdict.checks[0]["expected_length"], 3);
+        assert_eq!(verdict.checks[0]["actual_length"], 2);
+        assert!(!verdict.checks[0].to_string().contains("ab"));
         assert_eq!(verdict.checks[0]["ok"], false);
     }
 
@@ -842,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn long_text_is_truncated_in_receipts() {
+    fn long_text_never_appears_in_receipts() {
         let long = "x".repeat(5000);
         let verdict = built(
             Expectation::Value(&long),
@@ -850,7 +846,8 @@ mod tests {
             Effects::default(),
         );
         assert_eq!(verdict.verified, Some(true));
-        assert!(verdict.checks[0]["expected"].as_str().unwrap().len() < 300);
+        assert_eq!(verdict.checks[0]["expected_length"], 5000);
+        assert!(verdict.checks[0].to_string().len() < 300);
     }
 
     fn watch_for(page_url: Option<&str>) -> ReceiptWatch {

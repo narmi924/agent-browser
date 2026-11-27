@@ -344,119 +344,204 @@ fn active_frame() -> Option<String> {
     ACTIVE_FRAME.get().and_then(|m| m.lock().unwrap().clone())
 }
 
-/// Object handle for the <iframe> element that owns a frame, resolved on the
-/// parent session. Works for same-process frames where no dedicated CDP
-/// session exists.
-pub(super) async fn frame_owner_object_id(
+/// Create an isolated execution world for `frame_id` on `session_id`.
+/// Works for both same-origin and same-site cross-origin in-process frames
+/// without relying on `contentDocument`.
+pub(super) async fn create_frame_isolated_world(
     client: &CdpClient,
     session_id: &str,
     frame_id: &str,
-) -> Result<String, String> {
-    let owner = client
+) -> Result<i64, String> {
+    let result = client
         .send_command(
-            "DOM.getFrameOwner",
-            Some(serde_json::json!({ "frameId": frame_id })),
-            Some(session_id),
-        )
-        .await?;
-    let backend_node_id = owner
-        .get("backendNodeId")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| format!("Could not resolve the owner element of frame {}", frame_id))?;
-    let result: DomResolveNodeResult = client
-        .send_command_typed(
-            "DOM.resolveNode",
-            &DomResolveNodeParams {
-                backend_node_id: Some(backend_node_id),
-                node_id: None,
-                object_group: Some("agent-browser".to_string()),
-            },
+            "Page.createIsolatedWorld",
+            Some(serde_json::json!({
+                "frameId": frame_id,
+                "worldName": "agent-browser-frame",
+                "grantUniveralAccess": false,
+            })),
             Some(session_id),
         )
         .await?;
     result
-        .object
-        .object_id
-        .ok_or_else(|| format!("No objectId for the owner element of frame {}", frame_id))
+        .get("executionContextId")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| format!("Could not create isolated world for frame {}", frame_id))
 }
 
-/// Find a selector inside a same-process iframe and return its center in
-/// top-level viewport coordinates (input events dispatch in that space).
-/// Same-origin access to contentDocument is what makes this possible; a
-/// cross-origin frame never takes this path because it has its own session.
+/// Find the CDP session that owns `frame_id` within the active tab's frame tree.
+/// Rejects frames belonging to background tabs even if their OOPIF sessions are
+/// retained in `iframe_sessions`.
+pub(super) async fn find_frame_host_session(
+    client: &CdpClient,
+    top_session: &str,
+    frame_id: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<String, String> {
+    let active = super::a11y::active_frame_sessions(client, top_session, iframe_sessions).await?;
+    active
+        .get(frame_id)
+        .cloned()
+        .ok_or_else(|| format!("Frame {} not found in active tab", frame_id))
+}
+
+/// Find a selector inside a same-process iframe (same-origin or same-site
+/// cross-origin) and return its click point in the host session's viewport,
+/// verified with `click_point::place_in_dispatch_viewport`.
 async fn resolve_center_in_same_process_frame(
     client: &CdpClient,
-    session_id: &str,
+    host_session: &str,
     frame_id: &str,
     selector: &str,
     require_actionable: bool,
     jitter: Option<(f64, f64)>,
 ) -> Result<ResolvedPoint, String> {
-    let owner_object_id = frame_owner_object_id(client, session_id, frame_id).await?;
-    let find_expr = build_find_element_js_in("doc", selector);
-    let jitter_js = jitter_literal(jitter);
-    let function = format!(
-        r#"async function() {{
-            const doc = this.contentDocument;
-            if (!doc) return null;
-            const el = {find_expr};
-            if (!el) return null;
-            const clickPoint = {CLICK_POINT_JS};
-            const point = el.getBoundingClientRect ? await clickPoint(el, doc) : {{ x: 0, y: 0, inView: false }};
-            const resolvePoint = {RESOLVE_CLICK_POINT_JS};
-            const topDoc = (point.view && point.view.document) || doc;
-            return resolvePoint(topDoc, el, point, {jitter_js});
-        }}"#,
-    );
-    let result = client
-        .send_command(
-            "Runtime.callFunctionOn",
-            Some(serde_json::json!({
-                "objectId": owner_object_id,
-                "functionDeclaration": function,
-                "returnByValue": true,
-                "awaitPromise": true,
-            })),
-            Some(session_id),
+    let object_id =
+        resolve_object_in_same_process_frame(client, host_session, frame_id, selector).await?;
+
+    let result = async {
+        let node = node_click_point(
+            client,
+            host_session,
+            &object_id,
+            selector,
+            Aim {
+                require_actionable,
+                jitter,
+            },
         )
-        .await?;
-    let value = result
-        .get("result")
-        .and_then(|r| r.get("value"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    parse_resolved_point(&value, selector, require_actionable)?
-        .ok_or_else(|| format!("Element not found in the selected frame: {}", selector))
+        .await?
+        .ok_or_else(|| format!("Element not found in the selected frame: {}", selector))?;
+
+        let describe: Value = client
+            .send_command(
+                "DOM.describeNode",
+                Some(serde_json::json!({ "objectId": object_id, "depth": 0 })),
+                Some(host_session),
+            )
+            .await?;
+        let backend_node_id = describe
+            .pointer("/node/backendNodeId")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| format!("Element not found in the selected frame: {}", selector))?;
+
+        place_node_point(
+            client,
+            host_session,
+            Some(frame_id),
+            backend_node_id,
+            node,
+            selector,
+        )
+        .await
+    }
+    .await;
+
+    let _ = client
+        .send_command(
+            "Runtime.releaseObject",
+            Some(serde_json::json!({ "objectId": object_id })),
+            Some(host_session),
+        )
+        .await;
+
+    result
 }
 
-/// Find a selector inside a same-process iframe and return its object handle.
-async fn resolve_object_in_same_process_frame(
+async fn extract_object_id_checking_exception(
     client: &CdpClient,
     session_id: &str,
+    result: &Value,
+) -> Result<Option<String>, String> {
+    let object_id = result
+        .pointer("/result/objectId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    if let Some(details) = result.get("exceptionDetails") {
+        if let Some(oid) = object_id {
+            let _ = client
+                .send_command(
+                    "Runtime.releaseObject",
+                    Some(serde_json::json!({ "objectId": oid })),
+                    Some(session_id),
+                )
+                .await;
+        }
+        let msg = details
+            .pointer("/exception/description")
+            .or_else(|| details.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("selector lookup failed");
+        return Err(format!("Evaluation error: {}", msg));
+    }
+    Ok(object_id)
+}
+
+/// Resolve a CSS/XPath selector to `(objectId, host_session)` in the active
+/// frame (or top document when `active_frame_id` is `None`). Returns `Ok(None)`
+/// only when the selector matches nothing; propagates CDP and evaluation errors.
+pub(super) async fn query_selector_object_in_frame(
+    client: &CdpClient,
+    top_session: &str,
+    active_frame_id: Option<&str>,
+    selector: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<Option<(String, String)>, String> {
+    let js = build_find_element_js(selector);
+    let (host_session, context_id) = match active_frame_id {
+        Some(fid) => {
+            let host = find_frame_host_session(client, top_session, fid, iframe_sessions).await?;
+            if iframe_sessions.get(fid).map(String::as_str) == Some(host.as_str()) {
+                (host, None)
+            } else {
+                let ctx = create_frame_isolated_world(client, &host, fid).await?;
+                (host, Some(ctx))
+            }
+        }
+        None => (top_session.to_string(), None),
+    };
+    let mut params = serde_json::json!({
+        "expression": js,
+        "returnByValue": false,
+        "awaitPromise": false,
+    });
+    if let Some(ctx) = context_id {
+        params["contextId"] = serde_json::json!(ctx);
+    }
+    let result = client
+        .send_command("Runtime.evaluate", Some(params), Some(&host_session))
+        .await?;
+    Ok(
+        extract_object_id_checking_exception(client, &host_session, &result)
+            .await?
+            .map(|oid| (oid, host_session)),
+    )
+}
+
+/// Find a selector inside a same-process iframe (same-origin or same-site
+/// cross-origin) and return its object handle in `host_session`.
+async fn resolve_object_in_same_process_frame(
+    client: &CdpClient,
+    host_session: &str,
     frame_id: &str,
     selector: &str,
 ) -> Result<String, String> {
-    let owner_object_id = frame_owner_object_id(client, session_id, frame_id).await?;
-    let find_expr = build_find_element_js_in("doc", selector);
-    let function = format!(
-        "function() {{ const doc = this.contentDocument; if (!doc) return null; return {find_expr}; }}",
-    );
+    let ctx_id = create_frame_isolated_world(client, host_session, frame_id).await?;
+    let js = build_find_element_js(selector);
     let result = client
         .send_command(
-            "Runtime.callFunctionOn",
+            "Runtime.evaluate",
             Some(serde_json::json!({
-                "objectId": owner_object_id,
-                "functionDeclaration": function,
+                "expression": js,
+                "contextId": ctx_id,
                 "returnByValue": false,
+                "awaitPromise": false,
             })),
-            Some(session_id),
+            Some(host_session),
         )
         .await?;
-    result
-        .get("result")
-        .and_then(|r| r.get("objectId"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
+    extract_object_id_checking_exception(client, host_session, &result)
+        .await?
         .ok_or_else(|| format!("Element not found in the selected frame: {}", selector))
 }
 
@@ -468,23 +553,11 @@ pub const STATE_NOT_VERIFIED: &str = "page navigated after the action; state not
 
 /// Whether an error says the document a ref points into is gone: the stale-ref
 /// guard, or the browser reporting a destroyed context.
-fn document_gone(error: &str) -> bool {
+pub(crate) fn document_gone(error: &str) -> bool {
     error.contains(STALE_DOCUMENT_MARKER)
         || error.contains("Cannot find context with specified id")
         || error.contains("Inspected target navigated or closed")
         || error.contains("Execution context was destroyed")
-}
-
-/// Run a read that confirms an action that already happened. A document that
-/// is gone by then is not a failure of the action: the read yields `None`.
-pub async fn read_after_action<T>(
-    read: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<Option<T>, String> {
-    match read.await {
-        Ok(value) => Ok(Some(value)),
-        Err(error) if document_gone(&error) => Ok(None),
-        Err(error) => Err(error),
-    }
 }
 
 /// Fail a ref whose document has been replaced since it was issued: the page
@@ -501,17 +574,22 @@ pub(super) async fn ensure_ref_document_current(
     let Some((issued_session, issued_loader)) = entry.document.as_ref() else {
         return Ok(());
     };
-    let effective_session_id = resolve_frame_session(frame, session_id, iframe_sessions);
     let stale = || {
         format!(
             "Ref @{ref_id} {STALE_DOCUMENT_MARKER} (the page navigated or the frame was removed). Take a new snapshot and use a fresh ref."
         )
     };
-    if issued_session != effective_session_id {
+    let effective_session_id = match frame {
+        Some(fid) => find_frame_host_session(client, session_id, fid, iframe_sessions)
+            .await
+            .map_err(|_| stale())?,
+        None => session_id.to_string(),
+    };
+    if issued_session != &effective_session_id {
         return Err(stale());
     }
     let Ok(tree) = client
-        .send_command_no_params("Page.getFrameTree", Some(effective_session_id))
+        .send_command_no_params("Page.getFrameTree", Some(effective_session_id.as_str()))
         .await
     else {
         return Ok(());
@@ -531,13 +609,18 @@ pub(super) async fn current_document(
     frame: Option<&str>,
     iframe_sessions: &HashMap<String, String>,
 ) -> Option<(String, String)> {
-    let effective_session_id = resolve_frame_session(frame, session_id, iframe_sessions);
+    let effective_session_id = match frame {
+        Some(fid) => find_frame_host_session(client, session_id, fid, iframe_sessions)
+            .await
+            .ok()?,
+        None => session_id.to_string(),
+    };
     let tree = client
-        .send_command_no_params("Page.getFrameTree", Some(effective_session_id))
+        .send_command_no_params("Page.getFrameTree", Some(effective_session_id.as_str()))
         .await
         .ok()?;
     let loader = super::snapshot::frame_loader(&tree["frameTree"], frame)?;
-    Some((effective_session_id.to_string(), loader.to_string()))
+    Some((effective_session_id, loader.to_string()))
 }
 
 async fn resolve_ref_center(
@@ -549,8 +632,11 @@ async fn resolve_ref_center(
     iframe_sessions: &HashMap<String, String>,
     aim: Aim,
 ) -> Result<(ResolvedPoint, String), String> {
-    let effective_session_id =
-        resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
+    let effective_session_id = match entry.frame_id.as_deref() {
+        Some(fid) => find_frame_host_session(client, session_id, fid, iframe_sessions).await?,
+        None => session_id.to_string(),
+    };
+    let effective_session_id = effective_session_id.as_str();
 
     // Try cached backend_node_id first (fast path)
     if let Some(backend_node_id) = entry.backend_node_id {
@@ -737,29 +823,31 @@ pub async fn resolve_element_point(
 
     // CSS selector: honor an active `frame <sel>` selection.
     if let Some(frame_id) = active_frame() {
+        let host_session =
+            find_frame_host_session(client, session_id, &frame_id, iframe_sessions).await?;
         // Cross-process iframe: its dedicated session's main frame IS the
         // iframe, so plain document-rooted resolution works there.
-        if let Some(frame_session) = iframe_sessions.get(&frame_id) {
+        if iframe_sessions.get(&frame_id).map(String::as_str) == Some(host_session.as_str()) {
             let resolved = resolve_by_selector(
                 client,
-                frame_session,
+                &host_session,
                 selector_or_ref,
                 require_actionable,
                 jitter,
             )
             .await?;
-            return Ok(point(resolved, frame_session));
+            return Ok(point(resolved, &host_session));
         }
         let resolved = resolve_center_in_same_process_frame(
             client,
-            session_id,
+            &host_session,
             &frame_id,
             selector_or_ref,
             require_actionable,
             jitter,
         )
         .await?;
-        return Ok(point(resolved, session_id));
+        return Ok(point(resolved, &host_session));
     }
     let resolved = resolve_by_selector(
         client,
@@ -974,8 +1062,11 @@ async fn resolve_ref_object_id(
     ref_id: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(String, String), String> {
-    let effective_session_id =
-        resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
+    let effective_session_id = match entry.frame_id.as_deref() {
+        Some(fid) => find_frame_host_session(client, session_id, fid, iframe_sessions).await?,
+        None => session_id.to_string(),
+    };
+    let effective_session_id = effective_session_id.as_str();
 
     // Try cached backend_node_id first (fast path)
     if let Some(backend_node_id) = entry.backend_node_id {
@@ -1053,7 +1144,9 @@ pub async fn resolve_element_object_id(
 
     // Selector fallback (CSS or XPath): honor an active `frame <sel>` selection.
     if let Some(frame_id) = active_frame() {
-        if let Some(frame_session) = iframe_sessions.get(&frame_id) {
+        let host_session =
+            find_frame_host_session(client, session_id, &frame_id, iframe_sessions).await?;
+        if iframe_sessions.get(&frame_id).map(String::as_str) == Some(host_session.as_str()) {
             let js = build_find_element_js(selector_or_ref);
             let result: EvaluateResult = client
                 .send_command_typed(
@@ -1063,19 +1156,19 @@ pub async fn resolve_element_object_id(
                         return_by_value: Some(false),
                         await_promise: Some(false),
                     },
-                    Some(frame_session.as_str()),
+                    Some(host_session.as_str()),
                 )
                 .await?;
             let object_id = result
                 .result
                 .object_id
                 .ok_or_else(|| format!("Element not found: {}", selector_or_ref))?;
-            return Ok((object_id, frame_session.clone()));
+            return Ok((object_id, host_session));
         }
         let object_id =
-            resolve_object_in_same_process_frame(client, session_id, &frame_id, selector_or_ref)
+            resolve_object_in_same_process_frame(client, &host_session, &frame_id, selector_or_ref)
                 .await?;
-        return Ok((object_id, session_id.to_string()));
+        return Ok((object_id, host_session));
     }
 
     let js = build_find_element_js(selector_or_ref);
@@ -1098,13 +1191,15 @@ pub async fn resolve_element_object_id(
     Ok((object_id, session_id.to_string()))
 }
 
+pub(crate) const IS_CONNECTED_JS: &str = "function() { return this.isConnected; }";
+
 /// Reports whether a resolved node has been removed from its document, releasing it if so.
 async fn is_detached(client: &CdpClient, session_id: &str, object_id: &str) -> bool {
     let result: Result<EvaluateResult, String> = client
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: "function() { return this.isConnected; }".to_string(),
+                function_declaration: IS_CONNECTED_JS.to_string(),
                 object_id: Some(object_id.to_string()),
                 arguments: None,
                 return_by_value: Some(true),
@@ -1145,9 +1240,7 @@ pub(super) fn resolve_ax_session<'a>(
     }
 }
 
-/// Resolve the effective CDP session for an element's frame.
-/// If the element's frame_id has a dedicated cross-origin iframe session, return it.
-/// Otherwise, return the parent session.
+#[cfg(test)]
 fn resolve_frame_session<'a>(
     frame_id: Option<&str>,
     session_id: &'a str,
@@ -1175,8 +1268,12 @@ async fn find_node_id_by_role_name(
             role, name
         ));
     }
+    let host_session = match frame_id {
+        Some(fid) => find_frame_host_session(client, session_id, fid, iframe_sessions).await?,
+        None => session_id.to_string(),
+    };
     let (ax_params, effective_session_id) =
-        resolve_ax_session(frame_id, session_id, iframe_sessions);
+        resolve_ax_session(frame_id, &host_session, iframe_sessions);
     let ax_tree: GetFullAXTreeResult = client
         .send_command_typed_raw(
             "Accessibility.getFullAXTree",
@@ -1255,7 +1352,7 @@ pub(super) fn top_document_lookup_expression(selector: &str) -> Option<String> {
 }
 
 /// Build a JS expression that finds a DOM element by CSS selector or XPath.
-fn build_find_element_js(selector: &str) -> String {
+pub(crate) fn build_find_element_js(selector: &str) -> String {
     build_find_element_js_in("document", selector)
 }
 
@@ -1276,7 +1373,7 @@ fn build_find_element_js_in(root: &str, selector: &str) -> String {
 }
 
 /// Build a JS expression that counts matching DOM elements by CSS selector or XPath.
-fn build_count_elements_js(selector: &str) -> String {
+pub(crate) fn build_count_elements_js(selector: &str) -> String {
     if let Some(xpath) = selector.strip_prefix("xpath=") {
         format!(
             "document.evaluate({}, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null).snapshotLength",
@@ -1289,6 +1386,101 @@ fn build_count_elements_js(selector: &str) -> String {
         )
     }
 }
+
+/// JS function source for `blockerAt(doc, el, x, y)`: returns a short
+/// description of the element that would actually receive a click at (x, y)
+/// when that element is unrelated to `el`, or null when the click would land
+/// on `el` (or something that activates it). Relations that count as "lands
+/// on el": shadow-including ancestors/descendants in either direction, and
+/// label/control association (custom checkboxes hide the input under a styled
+/// sibling inside the same label).
+/// Returns a CSS-like description of the element blocking `(x, y)` for `el`, or `null` if clear.
+/// When `rejectInteractiveDescendant` is true, an interactive control strictly inside `el` also blocks.
+pub(crate) const BLOCKER_AT_JS: &str = r#"(doc, el, x, y, rejectInteractiveDescendant) => {
+    // Descend from the given document through same-origin iframes so a point
+    // over a frame resolves to the element inside it, in that frame's space.
+    let d = doc, lx = x, ly = y;
+    let hit = d.elementFromPoint(lx, ly);
+    while (hit && (hit.tagName === 'IFRAME' || hit.tagName === 'FRAME') && hit.contentDocument && hit !== el) {
+        const r = hit.getBoundingClientRect();
+        const ownerWin = hit.ownerDocument.defaultView;
+        const style = ownerWin ? ownerWin.getComputedStyle(hit) : null;
+        const scaleX = hit.offsetWidth > 0 ? r.width / hit.offsetWidth : 1;
+        const scaleY = hit.offsetHeight > 0 ? r.height / hit.offsetHeight : 1;
+        const borderLeft = style ? (parseFloat(style.borderLeftWidth) || 0) : hit.clientLeft;
+        const borderTop = style ? (parseFloat(style.borderTopWidth) || 0) : hit.clientTop;
+        const padLeft = style ? (parseFloat(style.paddingLeft) || 0) : 0;
+        const padTop = style ? (parseFloat(style.paddingTop) || 0) : 0;
+        const padRight = style ? (parseFloat(style.paddingRight) || 0) : 0;
+        const padBottom = style ? (parseFloat(style.paddingBottom) || 0) : 0;
+        const contentLeft = r.x + (borderLeft + padLeft) * scaleX;
+        const contentTop = r.y + (borderTop + padTop) * scaleY;
+        const contentWidth = Math.max(0, hit.clientWidth - padLeft - padRight);
+        const contentHeight = Math.max(0, hit.clientHeight - padTop - padBottom);
+        const renderedWidth = contentWidth * scaleX;
+        const renderedHeight = contentHeight * scaleY;
+        if (
+            renderedWidth <= 0 || renderedHeight <= 0 ||
+            lx < contentLeft || lx >= contentLeft + renderedWidth ||
+            ly < contentTop || ly >= contentTop + renderedHeight
+        ) {
+            break;
+        }
+        const childWin = hit.contentDocument.defaultView;
+        const vw = (childWin && childWin.innerWidth) || contentWidth;
+        const vh = (childWin && childWin.innerHeight) || contentHeight;
+        lx = (lx - contentLeft) * (vw / renderedWidth);
+        ly = (ly - contentTop) * (vh / renderedHeight);
+        d = hit.contentDocument;
+        hit = d.elementFromPoint(lx, ly);
+    }
+    if (!hit || hit === el) return null;
+    const interactiveSel = 'button, a[href], area[href], input, select, textarea, summary, details, iframe, embed, object, [role], [onclick], [tabindex]:not([tabindex="-1"]), [contenteditable=""], [contenteditable="true"]';
+    const isInteractive = (n) => !!n && ((n.matches && n.matches(interactiveSel)) || typeof n.onclick === 'function');
+    const up = (n) => n.parentNode || n.host || (n.getRootNode && n.getRootNode().host) || null;
+    for (let n = hit; n; n = up(n)) {
+        if (n === el) {
+            if (rejectInteractiveDescendant) {
+                let interactiveHit = null;
+                for (let cur = hit; cur && cur !== el; cur = up(cur)) {
+                    if (isInteractive(cur)) {
+                        interactiveHit = cur;
+                        break;
+                    }
+                }
+                if (interactiveHit) {
+                    hit = interactiveHit;
+                    break;
+                }
+            }
+            return null;
+        }
+    }
+    for (let n = el; n; n = up(n)) { if (n === hit) return null; }
+    const hitLabel = hit.closest ? hit.closest('label') : null;
+    let hitInteractiveInsideLabel = false;
+    if (hitLabel) {
+        for (let cur = hit; cur && cur !== hitLabel; cur = up(cur)) {
+            if (isInteractive(cur)) {
+                hitInteractiveInsideLabel = true;
+                break;
+            }
+        }
+    }
+    if (!hitInteractiveInsideLabel && hitLabel && (hitLabel.control === el || hitLabel.contains(el))) return null;
+    const elLabel = el.closest ? el.closest('label') : null;
+    if (!hitInteractiveInsideLabel && elLabel && elLabel.contains(hit)) return null;
+    let desc = hit.tagName.toLowerCase();
+    if (hit.id) desc += '#' + hit.id;
+    else if (typeof hit.className === 'string' && hit.className.trim())
+        desc += '.' + hit.className.trim().split(/\s+/).slice(0, 2).join('.');
+    if (!hit.id && hit.closest) {
+        const anchored = hit.closest('[id]');
+        if (anchored && anchored !== hit)
+            desc += ' inside ' + anchored.tagName.toLowerCase() + '#' + anchored.id;
+    }
+    return desc;
+}"#;
 
 const CLICK_POINT_JS: &str = r#"(async (el, doc) => {
     const measure = () => {
@@ -1367,6 +1559,18 @@ const CLICK_POINT_JS: &str = r#"(async (el, doc) => {
     }
     return { x: m.x, y: m.y, lx: m.lx, ly: m.ly, view: m.view, inView: m.inView };
 })"#;
+
+/// Returns why a click at (x, y) cannot reach `el`, or null when it can.
+/// It fails open when the engine lacks an API it needs.
+pub(crate) const ACTIONABILITY_JS: &str = r#"(el, inView) => {
+    try {
+        const rect = el.getBoundingClientRect();
+        if ((rect.width <= 0 && rect.height <= 0) || ['hidden', 'collapse'].includes(el.ownerDocument.defaultView.getComputedStyle(el).visibility)) return 'not visible';
+        if (el.disabled || el.matches(':disabled')) return 'disabled';
+        if (!inView) return 'outside the viewport';
+    } catch (e) {}
+    return null;
+}"#;
 
 /// JS source for `resolvePoint(topDoc, el, point, jitter)`, which decides where
 /// a click on `el` should land. `point` is what `CLICK_POINT_JS` measured after
@@ -1698,19 +1902,22 @@ async fn resolve_by_selector(
         .ok_or_else(|| format!("Element not found: {}", selector))
 }
 
-pub(super) fn intercepted_error(target: &str, blocker: &str) -> String {
+pub(crate) fn intercepted_error(target: &str, blocker: &str) -> String {
     format!(
         "Element '{}' is covered by <{}> at every visible point, so the input would land on that element instead. Dismiss or interact with the covering element first (it is often a dialog, banner, or sticky header).",
         target, blocker
     )
 }
 
-fn not_actionable_error(target: &str, reason: &str) -> String {
+pub(crate) fn not_actionable_error(target: &str, reason: &str) -> String {
     format!(
         "Element '{}' is {}, so the click would not reach it",
         target, reason
     )
 }
+
+pub(crate) const ELEMENT_TEXT_JS: &str =
+    "function() { return this.innerText || this.textContent || ''; }";
 
 pub async fn get_element_text(
     client: &CdpClient,
@@ -1732,8 +1939,7 @@ pub async fn get_element_text(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration:
-                    "function() { return this.innerText || this.textContent || ''; }".to_string(),
+                function_declaration: ELEMENT_TEXT_JS.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),
@@ -1786,6 +1992,15 @@ pub async fn get_element_attribute(
 
     Ok(result.result.value.unwrap_or(Value::Null))
 }
+
+pub(crate) const ELEMENT_VISIBLE_JS: &str = r#"function() {
+                    const rect = this.getBoundingClientRect();
+                    const style = window.getComputedStyle(this);
+                    return rect.width > 0 && rect.height > 0 &&
+                           style.visibility !== 'hidden' &&
+                           style.display !== 'none' &&
+                           parseFloat(style.opacity) > 0;
+                }"#;
 
 /// What a field says about itself, so a recording can tell a credential
 /// from other input even when the field has no label.
@@ -1851,15 +2066,7 @@ pub async fn is_element_visible(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: r#"function() {
-                    const rect = this.getBoundingClientRect();
-                    const style = window.getComputedStyle(this);
-                    return rect.width > 0 && rect.height > 0 &&
-                           style.visibility !== 'hidden' &&
-                           style.display !== 'none' &&
-                           parseFloat(style.opacity) > 0;
-                }"#
-                .to_string(),
+                function_declaration: ELEMENT_VISIBLE_JS.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),
@@ -1875,6 +2082,9 @@ pub async fn is_element_visible(
         .and_then(|v| v.as_bool())
         .unwrap_or(false))
 }
+
+pub(crate) const ELEMENT_ENABLED_JS: &str =
+    "function() { return !this.disabled && !(this.matches && this.matches(':disabled')); }";
 
 pub async fn is_element_enabled(
     client: &CdpClient,
@@ -1896,7 +2106,7 @@ pub async fn is_element_enabled(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: "function() { return !this.disabled && !(this.matches && this.matches(':disabled')); }".to_string(),
+                function_declaration: ELEMENT_ENABLED_JS.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),
@@ -1913,32 +2123,9 @@ pub async fn is_element_enabled(
         .unwrap_or(true))
 }
 
-pub async fn is_element_checked(
-    client: &CdpClient,
-    session_id: &str,
-    ref_map: &RefMap,
-    selector_or_ref: &str,
-    iframe_sessions: &HashMap<String, String>,
-) -> Result<bool, String> {
-    let (object_id, effective_session_id) = resolve_element_object_id(
-        client,
-        session_id,
-        ref_map,
-        selector_or_ref,
-        iframe_sessions,
-    )
-    .await?;
-
-    // Mirrors Playwright's getChecked() with follow-label retargeting:
-    // 1. If element is a native checkbox/radio input, return .checked
-    // 2. If element has an ARIA checked role, return aria-checked
-    // 3. Follow label → input association (label.control)
-    // 4. Check for nested checkbox/radio input as last resort
-    let result: EvaluateResult = client
-        .send_command_typed(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: r#"function() {
+/// Reads whether `this` is checked: a checkbox or radio, an element with a
+/// checkbox-like role, a label's control, or a nested checkbox or radio.
+pub(crate) const ELEMENT_CHECKED_JS: &str = r#"function() {
                     var el = this;
                     // Native checkbox/radio input
                     var tag = el.tagName && el.tagName.toUpperCase();
@@ -1946,9 +2133,12 @@ pub async fn is_element_checked(
                         return el.checked;
                     }
                     // ARIA role-based checked state
-                    var role = el.getAttribute && el.getAttribute('role');
                     var ariaCheckedRoles = ['checkbox','radio','switch','menuitemcheckbox','menuitemradio','option','treeitem'];
-                    if (role && ariaCheckedRoles.indexOf(role) !== -1) {
+                    var role = ((el.getAttribute && el.getAttribute('role')) || '').split(/\s+/).filter(function(r) { return ariaCheckedRoles.indexOf(r) !== -1; })[0];
+                    if (role) {
+                        if ((role === 'option' || role === 'treeitem') && !el.hasAttribute('aria-checked')) {
+                            return el.getAttribute('aria-selected') === 'true';
+                        }
                         return el.getAttribute('aria-checked') === 'true';
                     }
                     // Follow label association (Playwright follow-label retarget)
@@ -1966,7 +2156,29 @@ pub async fn is_element_checked(
                     var input = el.querySelector && el.querySelector('input[type="checkbox"], input[type="radio"]');
                     if (input) return input.checked;
                     return false;
-                }"#.to_string(),
+                }"#;
+
+pub async fn is_element_checked(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<bool, String> {
+    let (object_id, effective_session_id) = resolve_element_object_id(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?;
+
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: ELEMENT_CHECKED_JS.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),
@@ -1982,6 +2194,62 @@ pub async fn is_element_checked(
         .and_then(|v| v.as_bool())
         .unwrap_or(false))
 }
+
+pub(crate) fn target_frame_id(ref_map: &RefMap, selector_or_ref: &str) -> Option<String> {
+    if let Some(ref_id) = parse_ref(selector_or_ref) {
+        ref_map.get(&ref_id).and_then(|e| e.frame_id.clone())
+    } else {
+        active_frame()
+    }
+}
+
+/// Scrolls the element in, places its click point in `session_id`'s viewport
+/// using browser geometry, and confirms the browser hit-test delivers the
+/// press to the element (or its activating label/subtree).
+pub(crate) async fn place_object_click_point(
+    client: &CdpClient,
+    session_id: &str,
+    frame_id: Option<&str>,
+    object_id: &str,
+    target: &str,
+) -> Result<(f64, f64), String> {
+    let mut point = node_click_point(
+        client,
+        session_id,
+        object_id,
+        target,
+        Aim {
+            require_actionable: true,
+            jitter: None,
+        },
+    )
+    .await?
+    .ok_or_else(|| format!("Element not found: {target}"))?
+    .centre;
+    let describe: Value = client
+        .send_command(
+            "DOM.describeNode",
+            Some(serde_json::json!({ "objectId": object_id, "depth": 0 })),
+            Some(session_id),
+        )
+        .await?;
+    let backend_node_id = describe
+        .pointer("/node/backendNodeId")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| format!("Element not found: {target}"))?;
+    super::click_point::place_form_control_in_dispatch_viewport(
+        client,
+        session_id,
+        frame_id,
+        backend_node_id,
+        &mut point,
+        target,
+    )
+    .await?;
+    Ok((point.x, point.y))
+}
+
+pub(crate) const ELEMENT_INNER_TEXT_JS: &str = "function() { return this.innerText || ''; }";
 
 pub async fn get_element_inner_text(
     client: &CdpClient,
@@ -2003,7 +2271,7 @@ pub async fn get_element_inner_text(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: "function() { return this.innerText || ''; }".to_string(),
+                function_declaration: ELEMENT_INNER_TEXT_JS.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),
@@ -2019,6 +2287,8 @@ pub async fn get_element_inner_text(
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_default())
 }
+
+pub(crate) const ELEMENT_INNER_HTML_JS: &str = "function() { return this.innerHTML || ''; }";
 
 pub async fn get_element_inner_html(
     client: &CdpClient,
@@ -2040,7 +2310,7 @@ pub async fn get_element_inner_html(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: "function() { return this.innerHTML || ''; }".to_string(),
+                function_declaration: ELEMENT_INNER_HTML_JS.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),
@@ -2056,6 +2326,9 @@ pub async fn get_element_inner_html(
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_default())
 }
+
+pub(crate) const ELEMENT_INPUT_VALUE_JS: &str =
+    "function() { return typeof this.value === 'string' ? this.value : ''; }";
 
 pub async fn get_element_input_value(
     client: &CdpClient,
@@ -2077,9 +2350,7 @@ pub async fn get_element_input_value(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration:
-                    "function() { return typeof this.value === 'string' ? this.value : ''; }"
-                        .to_string(),
+                function_declaration: ELEMENT_INPUT_VALUE_JS.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),
@@ -2135,6 +2406,11 @@ pub async fn set_element_value(
     Ok(())
 }
 
+pub(crate) const ELEMENT_BOUNDING_BOX_JS: &str = r#"function() {
+                    const r = this.getBoundingClientRect();
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }"#;
+
 pub async fn get_element_bounding_box(
     client: &CdpClient,
     session_id: &str,
@@ -2155,11 +2431,7 @@ pub async fn get_element_bounding_box(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: r#"function() {
-                    const r = this.getBoundingClientRect();
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
-                }"#
-                .to_string(),
+                function_declaration: ELEMENT_BOUNDING_BOX_JS.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),
@@ -2197,6 +2469,31 @@ pub async fn get_element_count(
     Ok(result.result.value.and_then(|v| v.as_i64()).unwrap_or(0))
 }
 
+pub(crate) const ELEMENT_STYLES_ALL_JS: &str = r#"function() {
+                    const s = window.getComputedStyle(this);
+                    const result = {};
+                    for (let i = 0; i < s.length; i++) {
+                        const p = s[i];
+                        result[p] = s.getPropertyValue(p);
+                    }
+                    return result;
+                }"#;
+
+/// Builds a function that returns the computed values of the given CSS properties.
+pub(crate) fn styles_js(properties: &[String]) -> String {
+    let props_json = serde_json::to_string(properties).unwrap_or("[]".to_string());
+    format!(
+        r#"function() {{
+                    const s = window.getComputedStyle(this);
+                    const props = {};
+                    const result = {{}};
+                    for (const p of props) result[p] = s.getPropertyValue(p);
+                    return result;
+                }}"#,
+        props_json
+    )
+}
+
 pub async fn get_element_styles(
     client: &CdpClient,
     session_id: &str,
@@ -2215,29 +2512,8 @@ pub async fn get_element_styles(
     .await?;
 
     let js = match properties {
-        Some(props) => {
-            let props_json = serde_json::to_string(&props).unwrap_or("[]".to_string());
-            format!(
-                r#"function() {{
-                    const s = window.getComputedStyle(this);
-                    const props = {};
-                    const result = {{}};
-                    for (const p of props) result[p] = s.getPropertyValue(p);
-                    return result;
-                }}"#,
-                props_json
-            )
-        }
-        None => r#"function() {
-                    const s = window.getComputedStyle(this);
-                    const result = {};
-                    for (let i = 0; i < s.length; i++) {
-                        const p = s[i];
-                        result[p] = s.getPropertyValue(p);
-                    }
-                    return result;
-                }"#
-        .to_string(),
+        Some(props) => styles_js(&props),
+        None => ELEMENT_STYLES_ALL_JS.to_string(),
     };
 
     let result: EvaluateResult = client
@@ -2383,33 +2659,6 @@ mod tests {
 
         assert!(map.get("e1").is_none());
         assert_eq!(map.next_ref_num(), 2);
-    }
-
-    #[tokio::test]
-    async fn read_after_action_tolerates_only_a_gone_document() {
-        let gone = format!("Ref @e1 {STALE_DOCUMENT_MARKER} (x)");
-        assert_eq!(
-            read_after_action(async { Ok::<_, String>(true) }).await,
-            Ok(Some(true))
-        );
-        assert_eq!(
-            read_after_action(async { Err::<bool, _>(gone) }).await,
-            Ok(None)
-        );
-        assert_eq!(
-            read_after_action(async {
-                Err::<bool, _>(
-                    "CDP error (Runtime.callFunctionOn): Cannot find context with specified id"
-                        .to_string(),
-                )
-            })
-            .await,
-            Ok(None)
-        );
-        assert_eq!(
-            read_after_action(async { Err::<bool, _>("Element not found: @e1".to_string()) }).await,
-            Err("Element not found: @e1".to_string())
-        );
     }
 
     #[test]

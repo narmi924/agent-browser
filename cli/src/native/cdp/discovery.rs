@@ -38,6 +38,25 @@ pub async fn discover_cdp_url_with_headers(
     headers: &[(String, String)],
     secure: bool,
 ) -> Result<String, String> {
+    discover_cdp_url_with_headers_and_tls(
+        host,
+        port,
+        query,
+        headers,
+        secure,
+        &crate::tls::TrustOptions::default(),
+    )
+    .await
+}
+
+pub async fn discover_cdp_url_with_headers_and_tls(
+    host: &str,
+    port: u16,
+    query: Option<&str>,
+    headers: &[(String, String)],
+    secure: bool,
+    trust: &crate::tls::TrustOptions,
+) -> Result<String, String> {
     discover(
         host,
         port,
@@ -45,6 +64,7 @@ pub async fn discover_cdp_url_with_headers(
         DEFAULT_DISCOVERY_TIMEOUT,
         headers,
         secure,
+        trust,
     )
     .await
 }
@@ -56,7 +76,16 @@ pub async fn discover_cdp_url_with_timeout(
     query: Option<&str>,
     timeout: Duration,
 ) -> Result<String, String> {
-    discover(host, port, query, timeout, &[], false).await
+    discover(
+        host,
+        port,
+        query,
+        timeout,
+        &[],
+        false,
+        &crate::tls::TrustOptions::default(),
+    )
+    .await
 }
 
 /// HTTP and WebSocket schemes for discovery. `secure` preserves the
@@ -76,17 +105,18 @@ async fn discover(
     timeout: Duration,
     headers: &[(String, String)],
     secure: bool,
+    trust: &crate::tls::TrustOptions,
 ) -> Result<String, String> {
-    let http_err = match discover_http_endpoints(host, port, query, timeout, headers, secure).await
-    {
-        Ok(ws_url) => return Ok(ws_url),
-        Err(e) => e,
-    };
+    let http_err =
+        match discover_http_endpoints(host, port, query, timeout, headers, secure, trust).await {
+            Ok(ws_url) => return Ok(ws_url),
+            Err(e) => e,
+        };
 
     // Final fallback: direct WebSocket at /devtools/browser.
     // Chrome 136+ with UI-based remote debugging (chrome://inspect) exposes
     // CDP over WebSocket but does not serve HTTP discovery endpoints.
-    match discover_cdp_ws(host, port, timeout, headers, secure).await {
+    match discover_cdp_ws(host, port, timeout, headers, secure, trust).await {
         Ok(ws_url) => Ok(append_query(&ws_url, query)),
         Err(ws_err) => Err(format!(
             "All CDP discovery methods failed for {}:{}: {}; WebSocket: {}",
@@ -104,7 +134,16 @@ pub async fn discover_cdp_http_endpoints(
     query: Option<&str>,
     timeout: Duration,
 ) -> Result<String, String> {
-    discover_http_endpoints(host, port, query, timeout, &[], false).await
+    discover_http_endpoints(
+        host,
+        port,
+        query,
+        timeout,
+        &[],
+        false,
+        &crate::tls::TrustOptions::default(),
+    )
+    .await
 }
 
 async fn discover_http_endpoints(
@@ -114,9 +153,10 @@ async fn discover_http_endpoints(
     timeout: Duration,
     headers: &[(String, String)],
     secure: bool,
+    trust: &crate::tls::TrustOptions,
 ) -> Result<String, String> {
     // Primary: /json/version (standard path)
-    let version_err = match fetch_cdp_info(host, port, timeout, headers, secure).await {
+    let version_err = match fetch_cdp_info(host, port, timeout, headers, secure, trust).await {
         Ok(info) => {
             if let Some(ws_url) = info.web_socket_debugger_url {
                 return Ok(append_query(
@@ -133,7 +173,7 @@ async fn discover_http_endpoints(
     };
 
     // Fallback: /json/list (returns target list; look for the browser target)
-    match fetch_cdp_list(host, port, timeout, headers, secure).await {
+    match fetch_cdp_list(host, port, timeout, headers, secure, trust).await {
         Ok(ws_url) => Ok(append_query(
             &rewrite_ws_host(&ws_url, host, port, secure),
             query,
@@ -161,6 +201,7 @@ async fn fetch_cdp_info(
     timeout: Duration,
     headers: &[(String, String)],
     secure: bool,
+    trust: &crate::tls::TrustOptions,
 ) -> Result<BrowserVersionInfo, String> {
     let (http_scheme, _) = discovery_schemes(secure);
     let url = format!(
@@ -170,7 +211,7 @@ async fn fetch_cdp_info(
         port
     );
 
-    let body = tokio::time::timeout(timeout, reqwest_get_string(&url, headers))
+    let body = tokio::time::timeout(timeout, reqwest_get_string(&url, headers, trust))
         .await
         .map_err(|_| format!("Timeout connecting to CDP at {}:{}", host, port))?
         .map_err(|e| format!("Failed to connect to CDP at {}:{}: {}", host, port, e))?;
@@ -228,6 +269,7 @@ async fn fetch_cdp_list(
     timeout: Duration,
     headers: &[(String, String)],
     secure: bool,
+    trust: &crate::tls::TrustOptions,
 ) -> Result<String, String> {
     let (http_scheme, _) = discovery_schemes(secure);
     let url = format!(
@@ -237,7 +279,7 @@ async fn fetch_cdp_list(
         port
     );
 
-    let body = tokio::time::timeout(timeout, reqwest_get_string(&url, headers))
+    let body = tokio::time::timeout(timeout, reqwest_get_string(&url, headers, trust))
         .await
         .map_err(|_| format!("Timeout connecting to /json/list at {}:{}", host, port))?
         .map_err(|e| {
@@ -273,6 +315,7 @@ async fn discover_cdp_ws(
     timeout: Duration,
     headers: &[(String, String)],
     secure: bool,
+    trust: &crate::tls::TrustOptions,
 ) -> Result<String, String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
@@ -294,10 +337,17 @@ async fn discover_cdp_ws(
         }
     }
 
+    let connector = if secure {
+        crate::tls::tungstenite_connector(trust)?
+    } else {
+        None
+    };
+
     tokio::time::timeout(timeout, async {
-        let (mut ws_stream, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| format!("WebSocket connect failed at {}: {}", ws_url, e))?;
+        let (mut ws_stream, _) =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
+                .await
+                .map_err(|e| format!("WebSocket connect failed at {}: {}", ws_url, e))?;
 
         let cmd = r#"{"id":1,"method":"Browser.getVersion"}"#;
         ws_stream
@@ -332,8 +382,12 @@ async fn discover_cdp_ws(
     .map(|()| ws_url)
 }
 
-async fn reqwest_get_string(url: &str, headers: &[(String, String)]) -> Result<String, String> {
-    let mut builder = reqwest::Client::builder();
+async fn reqwest_get_string(
+    url: &str,
+    headers: &[(String, String)],
+    trust: &crate::tls::TrustOptions,
+) -> Result<String, String> {
+    let mut builder = crate::tls::apply_to_reqwest(reqwest::Client::builder(), trust)?;
     if !headers.is_empty() {
         // Custom auth headers would follow a redirect to any host; keep them on
         // the origin the user supplied.
